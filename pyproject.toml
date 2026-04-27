@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paperpilot-v2"
+version = "0.1.0"
+description = "Refactored foundation for PaperPilot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.28",
+  "openai>=1.0",
+  "langchain-core>=0.3.10",
+  "deepxiv-sdk>=0.2.4",
+  "pypdf>=5.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["paperpilot*"]

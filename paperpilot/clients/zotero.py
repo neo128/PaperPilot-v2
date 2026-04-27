@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, List, Optional
+
+import requests
+
+from paperpilot.utils.http import create_session, request_with_retry
+
+
+def parse_next_link(link_header: Optional[str]) -> Optional[str]:
+    if not link_header:
+        return None
+    for chunk in link_header.split(","):
+        parts = chunk.split(";")
+        if len(parts) < 2:
+            continue
+        url_part = parts[0].strip()
+        rel_part = parts[1].strip()
+        if rel_part == 'rel="next"':
+            return url_part.strip("<>")
+    return None
+
+
+class ZoteroClient:
+    def __init__(
+        self,
+        user_id: str,
+        api_key: str,
+        use_env_proxy: bool = True,
+        user_agent: str = "PaperPilot-v2/0.1",
+        timeout: int = 30,
+    ) -> None:
+        self.base = f"https://api.zotero.org/users/{user_id}"
+        self.timeout = timeout
+        self._proxy_disabled = not use_env_proxy
+        self.session = create_session(
+            headers={"Zotero-API-Key": api_key, "User-Agent": user_agent},
+            use_env_proxy=use_env_proxy,
+        )
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        try:
+            return request_with_retry(self.session, method, url, timeout=self.timeout, **kwargs)
+        except requests.exceptions.ProxyError:
+            if self._proxy_disabled:
+                raise
+            self._proxy_disabled = True
+            self.session.trust_env = False
+            self.session.proxies = {}
+            return request_with_retry(self.session, method, url, timeout=self.timeout, **kwargs)
+
+    def list_collections(self) -> Dict[str, Dict[str, Optional[str]]]:
+        resp = self._request(
+            "get",
+            f"{self.base}/collections",
+            params={"limit": 200, "format": "json", "include": "data"},
+        )
+        out: Dict[str, Dict[str, Optional[str]]] = {}
+        for entry in resp.json():
+            data = entry.get("data", {})
+            out[data.get("name")] = {
+                "key": entry.get("key"),
+                "parent": data.get("parentCollection"),
+            }
+        return out
+
+    def list_child_collections(self, parent_key: str) -> List[Dict[str, Optional[str]]]:
+        resp = self._request(
+            "get",
+            f"{self.base}/collections/{parent_key}/collections",
+            params={"limit": 200, "format": "json", "include": "data"},
+        )
+        out: List[Dict[str, Optional[str]]] = []
+        for entry in resp.json():
+            data = entry.get("data", {})
+            out.append({"key": entry.get("key"), "name": data.get("name"), "parent": data.get("parentCollection")})
+        return out
+
+    def resolve_collection_key(self, collection_name: str) -> Optional[str]:
+        collections = self.list_collections()
+        for name, info in collections.items():
+            if name == collection_name or (name and name.lower() == collection_name.lower()):
+                return info["key"]
+        return None
+
+    def create_collection_if_missing(self, name: str) -> str:
+        existing = self.resolve_collection_key(name)
+        if existing:
+            return existing
+        self._request("post", f"{self.base}/collections", json=[{"name": name}])
+        created = self.resolve_collection_key(name)
+        if not created:
+            raise RuntimeError(f"Collection created but could not be resolved: {name}")
+        return created
+
+    def iter_items(
+        self,
+        collection: Optional[str] = None,
+        tag: Optional[str] = None,
+        limit: int = 100,
+        top_only: bool = True,
+    ) -> Iterable[Dict[str, Any]]:
+        if collection:
+            url = f"{self.base}/collections/{collection}/items/top" if top_only else f"{self.base}/collections/{collection}/items"
+        else:
+            url = f"{self.base}/items/top" if top_only else f"{self.base}/items"
+
+        params = {"format": "json", "include": "data", "limit": 100}
+        if tag:
+            params["tag"] = tag
+        remaining = limit if (limit and limit > 0) else None
+
+        while url:
+            resp = self._request("get", url, params=params)
+            for entry in resp.json():
+                yield entry
+                if remaining is not None:
+                    remaining -= 1
+                    if remaining == 0:
+                        return
+            url = parse_next_link(resp.headers.get("Link"))
+            params = None
+
+    def iter_top_items(self, limit: int = 100) -> Iterable[Dict[str, Any]]:
+        yield from self.iter_items(limit=limit, top_only=True)
+
+    def fetch_item(self, item_key: str) -> Dict[str, Any]:
+        resp = self._request("get", f"{self.base}/items/{item_key}", params={"format": "json", "include": "data"})
+        return resp.json()
+
+    def fetch_children(self, parent_key: str) -> List[Dict[str, Any]]:
+        url = f"{self.base}/items/{parent_key}/children"
+        params = {"format": "json", "include": "data", "limit": 100}
+        out: List[Dict[str, Any]] = []
+        while url:
+            resp = self._request("get", url, params=params)
+            out.extend(resp.json())
+            url = parse_next_link(resp.headers.get("Link"))
+            params = None
+        return out
+
+    def create_items(self, items: List[Dict[str, Any]]) -> List[str]:
+        resp = self._request("post", f"{self.base}/items", json=items)
+        data = resp.json()
+        successful = data.get("successful") or {}
+        keys: List[str] = []
+        for _, info in successful.items():
+            if isinstance(info, dict) and info.get("key"):
+                keys.append(info["key"])
+        return keys
+
+    def update_item(self, item_key: str, version: int, new_data: Dict[str, Any]) -> None:
+        self._request(
+            "put",
+            f"{self.base}/items/{item_key}",
+            json=new_data,
+            headers={"If-Unmodified-Since-Version": str(version)},
+        )
+
+    def create_note(self, parent_key: str, note_html: str, tags: Optional[List[str]] = None) -> None:
+        payload = [{"itemType": "note", "parentItem": parent_key, "note": note_html, "tags": [{"tag": t} for t in (tags or [])]}]
+        self._request("post", f"{self.base}/items", json=payload)
+
+    def create_attachment_url(
+        self,
+        parent_key: str,
+        title: str,
+        url: str,
+        content_type: str = "application/pdf",
+    ) -> None:
+        payload = [{
+            "itemType": "attachment",
+            "parentItem": parent_key,
+            "title": title,
+            "linkMode": "linked_url",
+            "contentType": content_type,
+            "url": url,
+        }]
+        self._request("post", f"{self.base}/items", json=payload)
