@@ -40,6 +40,15 @@ DeepXiv 配置建议：
 - `DEEPXIV_BASE_URL=https://data.rag.ac.cn`
 - 不要在该值后面额外加 `/api`，否则 `search / brief / preview` 会命中错误路径
 
+AI 配置建议写在本地 `.env`，不要提交真实 key：
+
+```bash
+AI_PROVIDER=openai
+AI_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+AI_API_KEY=你的阿里云TokenPlanKey
+AI_MODEL=你的模型名
+```
+
 ## 统一 CLI
 
 ```bash
@@ -57,6 +66,82 @@ python -m paperpilot.cli.watch "agent memory" --dry-run
 python -m paperpilot.cli.summary --tag AI
 python -m paperpilot.cli.notion_sync --dry-run
 python -m paperpilot.cli.pipeline --summary-use-deepxiv --notion-dry-run
+```
+
+## 文献综述 Phase 1：检索并纳入 Zotero
+
+`watch` 可作为系统性综述的第一步：根据主题或提示词检索论文，先在 Zotero 中按 DOI / arXiv ID / 标题查重；命中已有条目则直接复用，未命中才新增。
+
+```bash
+python -m paperpilot.cli.watch "agent memory" \
+  --expand-queries \
+  --prompt "long-term autonomous agent memory benchmark dataset survey" \
+  --journals \
+  --limit 30 \
+  --collection-name "Review - Agent Memory" \
+  --create-collections
+```
+
+如果只想预览候选数量和将要新增的条目：
+
+```bash
+python -m paperpilot.cli.watch "agent memory" --expand-queries --dry-run
+```
+
+## 文献综述自动化
+
+`review` 是面向系统性综述的新入口，会在本地建立可复核的综述工作区，并把 Zotero 文献库作为文献管理中心。
+
+```bash
+python -m paperpilot.cli.main review init \
+  --topic "agent memory" \
+  --slug agent-memory
+
+python -m paperpilot.cli.main review build-pool \
+  --slug agent-memory \
+  --topic "agent memory" \
+  --collection-name "Review - Agent Memory" \
+  --limit 100
+
+python -m paperpilot.cli.main review read \
+  --slug agent-memory \
+  --topic "agent memory" \
+  --limit 25 \
+  --use-deepxiv
+
+python -m paperpilot.cli.main review draft \
+  --slug agent-memory \
+  --topic "agent memory"
+```
+
+也可以一条命令串起检索、Zotero 去重/新增、论文池构建、AI 精读编码和综述草稿：
+
+```bash
+python -m paperpilot.cli.main review run \
+  --topic "agent memory" \
+  --slug agent-memory \
+  --collection-name "Review - Agent Memory" \
+  --expand-queries \
+  --prompt "long-term autonomous agent memory benchmark dataset survey" \
+  --journals \
+  --limit 30 \
+  --use-deepxiv
+```
+
+默认产物在 `.review_projects/{slug}/`：
+
+```text
+research_plan.md
+data/raw/paper_pool_raw.csv
+data/processed/paper_pool_verified.csv
+data/processed/paper_pool_coded.csv
+notes/core/*.md
+bib/citation_keys.csv
+bib/references.bib
+reports/paper_pool_verification_report.md
+reports/deep_reading_status.md
+reports/review_draft.md
+review_v1.md
 ```
 
 ## 当前状态

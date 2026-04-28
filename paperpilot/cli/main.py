@@ -6,6 +6,7 @@ from pathlib import Path
 
 from paperpilot.cli.notion_sync import main as notion_sync_main
 from paperpilot.cli.pipeline import main as pipeline_main
+from paperpilot.cli.review import main as review_main
 from paperpilot.cli.summary import main as summary_main
 from paperpilot.cli.watch import main as watch_main
 from paperpilot.pipeline import NotionStageConfig, PipelineConfig, PipelineOrchestrator, SummaryStageConfig, WatchStageConfig
@@ -15,10 +16,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="paperpilot", description="PaperPilot v2 unified CLI")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("watch")
-    sub.add_parser("summary")
-    sub.add_parser("notion-sync")
-    sub.add_parser("pipeline")
+    sub.add_parser("watch", add_help=False)
+    sub.add_parser("summary", add_help=False)
+    sub.add_parser("notion-sync", add_help=False)
+    sub.add_parser("pipeline", add_help=False)
+    sub.add_parser("review", add_help=False)
 
     run = sub.add_parser("run", help="Run unified pipeline")
     run.add_argument("--watch-query")
@@ -51,6 +53,9 @@ def main() -> None:
         return
     if args.command == "pipeline":
         pipeline_main()
+        return
+    if args.command == "review":
+        review_main()
         return
     if args.command == "run":
         config = PipelineConfig(

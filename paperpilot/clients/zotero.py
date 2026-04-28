@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -19,6 +20,57 @@ def parse_next_link(link_header: Optional[str]) -> Optional[str]:
         if rel_part == 'rel="next"':
             return url_part.strip("<>")
     return None
+
+
+def _entry_data(entry: Dict[str, Any]) -> Dict[str, Any]:
+    data = entry.get("data")
+    return data if isinstance(data, dict) else entry
+
+
+def _normalize_title(value: Any) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _normalize_doi(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", text)
+    return text.strip()
+
+
+def _normalize_arxiv_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(
+        r"(?P<id>(?:[a-z\-]+(?:\.[a-z\-]+)?/\d{7}|\d{4}\.\d{4,5}))(?:v\d+)?(?:\.pdf)?",
+        text,
+        re.I,
+    )
+    return match.group("id") if match else text
+
+
+def _entry_matches_candidate(entry: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
+    data = _entry_data(entry)
+
+    candidate_doi = _normalize_doi(candidate.get("doi") or candidate.get("DOI"))
+    entry_doi = _normalize_doi(data.get("DOI") or data.get("doi"))
+    if candidate_doi and entry_doi and candidate_doi == entry_doi:
+        return True
+
+    candidate_arxiv = _normalize_arxiv_id(
+        candidate.get("arxiv_id") or candidate.get("archiveLocation") or candidate.get("src_url") or candidate.get("url")
+    )
+    entry_arxiv = _normalize_arxiv_id(
+        data.get("archiveLocation") or data.get("url") or data.get("DOI") or data.get("extra")
+    )
+    if candidate_arxiv and entry_arxiv and candidate_arxiv == entry_arxiv:
+        return True
+
+    candidate_title = _normalize_title(candidate.get("title"))
+    entry_title = _normalize_title(data.get("title"))
+    return bool(candidate_title and entry_title and candidate_title == entry_title)
 
 
 class ZoteroClient:
@@ -124,6 +176,50 @@ class ZoteroClient:
     def iter_top_items(self, limit: int = 100) -> Iterable[Dict[str, Any]]:
         yield from self.iter_items(limit=limit, top_only=True)
 
+    def search_items(self, query: str, limit: int = 25, top_only: bool = True) -> List[Dict[str, Any]]:
+        url = f"{self.base}/items/top" if top_only else f"{self.base}/items"
+        resp = self._request(
+            "get",
+            url,
+            params={
+                "format": "json",
+                "include": "data",
+                "q": query,
+                "qmode": "everything",
+                "limit": min(max(limit, 1), 100),
+            },
+        )
+        return list(resp.json())
+
+    def find_existing_item(self, candidate: Dict[str, Any], limit: int = 25) -> Optional[Dict[str, Any]]:
+        """Find an existing Zotero top-level item by DOI, arXiv id, or exact normalized title."""
+        terms: List[str] = []
+        doi = _normalize_doi(candidate.get("doi") or candidate.get("DOI"))
+        if doi:
+            terms.append(doi)
+        arxiv_id = _normalize_arxiv_id(
+            candidate.get("arxiv_id") or candidate.get("archiveLocation") or candidate.get("src_url") or candidate.get("url")
+        )
+        if arxiv_id:
+            terms.append(arxiv_id)
+        title = str(candidate.get("title") or "").strip()
+        if title:
+            terms.append(title)
+
+        seen_queries: set[str] = set()
+        for term in terms:
+            if not term or term in seen_queries:
+                continue
+            seen_queries.add(term)
+            try:
+                matches = self.search_items(term, limit=limit, top_only=True)
+            except Exception:
+                continue
+            for entry in matches:
+                if _entry_matches_candidate(entry, candidate):
+                    return entry
+        return None
+
     def fetch_item(self, item_key: str) -> Dict[str, Any]:
         resp = self._request("get", f"{self.base}/items/{item_key}", params={"format": "json", "include": "data"})
         return resp.json()
@@ -140,7 +236,22 @@ class ZoteroClient:
         return out
 
     def create_items(self, items: List[Dict[str, Any]]) -> List[str]:
-        resp = self._request("post", f"{self.base}/items", json=items)
+        keys: List[str] = []
+        for start in range(0, len(items), 25):
+            keys.extend(self._create_items_batch(items[start : start + 25]))
+        return keys
+
+    def _create_items_batch(self, items: List[Dict[str, Any]]) -> List[str]:
+        if not items:
+            return []
+        try:
+            resp = self._request("post", f"{self.base}/items", json=items)
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 413 and len(items) > 1:
+                mid = max(1, len(items) // 2)
+                return self._create_items_batch(items[:mid]) + self._create_items_batch(items[mid:])
+            raise
         data = resp.json()
         successful = data.get("successful") or {}
         keys: List[str] = []
@@ -156,6 +267,20 @@ class ZoteroClient:
             json=new_data,
             headers={"If-Unmodified-Since-Version": str(version)},
         )
+
+    def add_item_to_collection(self, item_key: str, collection_key: str) -> bool:
+        entry = self.fetch_item(item_key)
+        data = dict(_entry_data(entry))
+        collections = list(data.get("collections") or [])
+        if collection_key in collections:
+            return False
+        collections.append(collection_key)
+        data["collections"] = collections
+        version = entry.get("version") or data.get("version")
+        if version is None:
+            raise RuntimeError(f"Cannot update Zotero item without version: {item_key}")
+        self.update_item(item_key, int(version), data)
+        return True
 
     def create_note(self, parent_key: str, note_html: str, tags: Optional[List[str]] = None) -> None:
         payload = [{"itemType": "note", "parentItem": parent_key, "note": note_html, "tags": [{"tag": t} for t in (tags or [])]}]

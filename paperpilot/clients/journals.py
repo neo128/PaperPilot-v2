@@ -47,6 +47,9 @@ VENUES: List[Dict[str, str]] = [
 S2_BASE = "https://api.semanticscholar.org/graph/v1/paper/search"
 S2_FIELDS = "title,abstract,authors,year,externalIds,url,venue,publicationTypes"
 S2_RATE_DELAY = 0.25  # seconds between S2 requests to stay well under 100 req/5min
+S2_RATE_LIMIT_COOLDOWN = 300  # seconds to skip S2 after a rate-limit response
+_S2_RATE_LIMITED_UNTIL = 0.0
+_S2_RATE_LIMIT_NOTICE_EMITTED = False
 
 CR_BASE = "https://api.crossref.org/works"
 CR_RATE_DELAY = 0.15  # polite pool rate
@@ -60,6 +63,12 @@ USER_AGENT = "PaperPilot-v2/0.1 (paper retrieval; mailto:admin@example.com)"
 
 def _s2_search(query: str, venue_names: List[str], limit: int) -> List[Dict[str, Any]]:
     """Search S2 with venue name(s) AND query keyword, then post-filter by venue string."""
+    global _S2_RATE_LIMIT_NOTICE_EMITTED, _S2_RATE_LIMITED_UNTIL
+    if time.time() < _S2_RATE_LIMITED_UNTIL:
+        logger.debug("S2 rate-limit cooldown active, skipping S2 for query=%s", query)
+        return []
+    _S2_RATE_LIMIT_NOTICE_EMITTED = False
+
     results: List[Dict[str, Any]] = []
     seen_titles: set[str] = set()
 
@@ -77,11 +86,19 @@ def _s2_search(query: str, venue_names: List[str], limit: int) -> List[Dict[str,
     try:
         resp = requests.get(url, params=params, timeout=30, headers={"User-Agent": USER_AGENT})
         if resp.status_code == 429:
-            logger.warning("S2 rate limited, waiting and retrying once")
+            logger.debug("S2 rate limited, waiting and retrying once")
             time.sleep(2)
             resp = requests.get(url, params=params, timeout=30, headers={"User-Agent": USER_AGENT})
+            if resp.status_code == 429:
+                _S2_RATE_LIMITED_UNTIL = time.time() + S2_RATE_LIMIT_COOLDOWN
+                if not _S2_RATE_LIMIT_NOTICE_EMITTED:
+                    logger.debug(
+                        "S2 rate limited; using CrossRef-only journal search for the next %d seconds",
+                        S2_RATE_LIMIT_COOLDOWN,
+                    )
+                    _S2_RATE_LIMIT_NOTICE_EMITTED = True
         if resp.status_code != 200:
-            logger.warning("S2 search returned %d for query=%s", resp.status_code, query)
+            logger.debug("S2 search returned %d for query=%s", resp.status_code, query)
             return []
         data = resp.json() or {}
     except Exception as exc:

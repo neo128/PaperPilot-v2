@@ -53,7 +53,7 @@ def load_app_settings(env_file: str | Path = ".env") -> AppSettings:
     ai = AISettings(
         provider=optional_env("AI_PROVIDER", "openai") or "openai",
         base_url=optional_env("AI_BASE_URL"),
-        api_key=optional_env("AI_API_KEY"),
+        api_key=optional_env("AI_API_KEY") or optional_env("OPENAI_API_KEY"),
         model=optional_env("AI_MODEL"),
     )
 

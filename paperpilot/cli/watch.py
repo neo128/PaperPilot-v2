@@ -25,6 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--create-collections", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--journals", action="store_true", help="Also search curated journals/conferences (Nature, Science, CVPR, ICRA, etc.)")
+    parser.add_argument("--prompt", help="Additional review prompt used when expanding literature-search query groups.")
+    parser.add_argument("--expand-queries", action="store_true", help="Expand the topic into Phase-1 query groups such as benchmark/survey/dataset/system.")
+    parser.add_argument("--no-reuse-existing", action="store_true", help="Create Zotero items without checking whether matching items already exist.")
     return parser.parse_args(_cli_args())
 
 
@@ -33,7 +36,7 @@ def main() -> None:
     settings = load_app_settings()
     deepxiv = DeepXivClient()
     zotero = ZoteroClient(settings.zotero.user_id, settings.zotero.api_key)
-    service = WatchService(deepxiv, zotero)
+    service = WatchService(zotero=zotero, deepxiv=deepxiv)
     result = service.search_and_import(
         WatchOptions(
             query=args.query,
@@ -42,10 +45,13 @@ def main() -> None:
             collection_name=args.collection_name,
             dry_run=args.dry_run,
             journals=args.journals,
+            prompt=args.prompt,
+            expand_queries=args.expand_queries,
+            reuse_existing=not args.no_reuse_existing,
         )
     )
     print(
-        f"watch done, processed={result.processed}, created={result.created}, skipped={result.skipped}, failed={result.failed}"
+        f"watch done, processed={result.processed}, created={result.created}, updated={result.updated}, skipped={result.skipped}, failed={result.failed}"
     )
 
 
