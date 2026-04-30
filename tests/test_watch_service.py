@@ -144,6 +144,36 @@ class WatchServiceTest(unittest.TestCase):
         self.assertEqual(result.created, 1)
         self.assertIsNotNone(zotero.created_payloads)
 
+    def test_expand_queries_splits_source_limit_across_queries(self):
+        zotero = FakeZotero()
+
+        class RecordingDeepXiv:
+            def __init__(self):
+                self.calls = []
+
+            def search(self, query, limit=10):
+                self.calls.append((query, limit))
+                return {"items": []}
+
+        class RecordingArxiv:
+            def __init__(self):
+                self.calls = []
+
+            def search_recent(self, query, limit=10, days=30):
+                self.calls.append((query, limit))
+                return []
+
+        deepxiv = RecordingDeepXiv()
+        arxiv = RecordingArxiv()
+        service = WatchService(zotero=zotero, deepxiv=deepxiv, arxiv=arxiv)
+
+        result = service.search_and_import(WatchOptions(query="agent memory", limit=12, expand_queries=True, dry_run=True))
+
+        self.assertEqual(result.artifacts["per_query_limit"], 2)
+        self.assertEqual(len(deepxiv.calls), 6)
+        self.assertTrue(all(limit == 2 for _, limit in deepxiv.calls))
+        self.assertTrue(all(limit == 2 for _, limit in arxiv.calls))
+
     def test_search_and_import_reuses_existing_zotero_item(self):
         zotero = FakeZotero()
         zotero.existing = {"key": "EXISTING1", "data": {"key": "EXISTING1", "title": "Test Paper"}}

@@ -112,6 +112,43 @@ python -m paperpilot.cli.main review read \
 python -m paperpilot.cli.main review draft \
   --slug agent-memory \
   --topic "agent memory"
+
+python -m paperpilot.cli.main review qc \
+  --slug agent-memory \
+  --topic "agent memory"
+
+python -m paperpilot.cli.main review verify \
+  --slug agent-memory \
+  --topic "agent memory"
+
+python -m paperpilot.cli.main review fetch-pdfs \
+  --slug agent-memory \
+  --topic "agent memory" \
+  --unpaywall-email "you@example.com"
+
+python -m paperpilot.cli.main review read \
+  --slug agent-memory \
+  --topic "agent memory" \
+  --paper-id P001 \
+  --force
+
+python -m paperpilot.cli.main review matrix \
+  --slug agent-memory \
+  --topic "agent memory"
+```
+
+AI 精读编码后，可以先用 `curate` 自动筛掉明显偏题论文。默认是预览模式，只生成 curated CSV 和报告；确认后再加 `--apply` 覆盖 `paper_pool_coded.csv`，后续草稿会使用更新后的分层。
+
+```bash
+python -m paperpilot.cli.main review curate \
+  --slug agent-memory \
+  --topic "agent memory"
+
+python -m paperpilot.cli.main review curate \
+  --slug agent-memory \
+  --topic "agent memory" \
+  --exclude-keyword "clinical,epidemic,model cards" \
+  --apply
 ```
 
 也可以一条命令串起检索、Zotero 去重/新增、论文池构建、AI 精读编码和综述草稿：
@@ -135,12 +172,21 @@ research_plan.md
 data/raw/paper_pool_raw.csv
 data/processed/paper_pool_verified.csv
 data/processed/paper_pool_coded.csv
+data/processed/paper_pool_curated.csv
 notes/core/*.md
 bib/citation_keys.csv
 bib/references.bib
 reports/paper_pool_verification_report.md
+reports/curation_report.md
 reports/deep_reading_status.md
 reports/review_draft.md
+reports/qc_report.md
+reports/fulltext_verification_status.md
+reports/fulltext_fetch_status.md
+reports/comparison_matrix.md
+data/processed/fulltext_verification_queue.csv
+data/processed/fulltext_fetch_report.csv
+figs/taxonomy_overview.mmd
 review_v1.md
 ```
 

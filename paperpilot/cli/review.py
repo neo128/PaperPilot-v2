@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
 
 from paperpilot.clients.ai import AIClient
 from paperpilot.clients.deepxiv import DeepXivClient
+from paperpilot.clients.open_access import OpenAccessClient
 from paperpilot.clients.zotero import ZoteroClient
-from paperpilot.services.review_service import LiteratureReviewService, ReviewProject, ReviewReadOptions, slugify
+from paperpilot.services.review_service import (
+    LiteratureReviewService,
+    ReviewCurateOptions,
+    ReviewFetchPdfOptions,
+    ReviewMatrixOptions,
+    ReviewProject,
+    ReviewQCOptions,
+    ReviewReadOptions,
+    ReviewVerifyOptions,
+    slugify,
+)
 from paperpilot.services.watch_service import WatchOptions, WatchService
 from paperpilot.utils.config import AISettings, load_app_settings
 
@@ -42,12 +54,46 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("--max-chars", type=int, default=12000)
     read.add_argument("--use-deepxiv", action="store_true")
     read.add_argument("--insert-zotero-notes", action="store_true")
+    read.add_argument("--no-local-pdfs", action="store_true", help="Do not add project-local PDF text to reading context.")
+    read.add_argument("--pdf-max-pages", type=int, default=12)
+    read.add_argument("--paper-id", action="append", default=[], help="Read only a specific paper ID; repeatable.")
     read.add_argument("--model")
 
     draft = sub.add_parser("draft", help="Draft review_v1.md from coded pool and reading cards")
     _add_project_args(draft)
     draft.add_argument("--locale", default="zh")
     draft.add_argument("--model")
+
+    qc = sub.add_parser("qc", help="Run automated QC checks on coded pool, citations, and review draft")
+    _add_project_args(qc)
+    qc.add_argument("--draft-path", default="reports/review_draft.md", help="Draft path relative to project root, or an absolute path.")
+
+    matrix = sub.add_parser("matrix", help="Build taxonomy and comparison matrices from the coded pool")
+    _add_project_args(matrix)
+    matrix.add_argument("--include-tier", action="append", default=[], help="Tier letter to include. Defaults to A, B, and C.")
+
+    verify = sub.add_parser("verify", help="Build a full-text verification queue for core review papers")
+    _add_project_args(verify)
+    verify.add_argument("--include-tier", action="append", default=[], help="Tier letter to include. Defaults to A and B.")
+    verify.add_argument("--skip-zotero", action="store_true", help="Do not inspect Zotero child attachments.")
+    verify.add_argument("--storage-dir", help="Override local Zotero storage directory.")
+
+    fetch_pdfs = sub.add_parser("fetch-pdfs", help="Fetch open-access PDFs for core review papers")
+    _add_project_args(fetch_pdfs)
+    fetch_pdfs.add_argument("--include-tier", action="append", default=[], help="Tier letter to include. Defaults to A and B.")
+    fetch_pdfs.add_argument("--unpaywall-email", help="Email for Unpaywall DOI lookup. Defaults to UNPAYWALL_EMAIL.")
+    fetch_pdfs.add_argument("--output-dir", help="PDF output directory. Defaults to data/interim/pdfs under the review project.")
+    fetch_pdfs.add_argument("--attach-zotero", action="store_true", help="Create Zotero linked-url PDF attachments for discovered OA PDFs.")
+    fetch_pdfs.add_argument("--dry-run", action="store_true", help="Discover OA PDFs without downloading or attaching.")
+    fetch_pdfs.add_argument("--force", action="store_true", help="Redownload even if a local PDF already exists.")
+    fetch_pdfs.add_argument("--limit", type=int, default=0)
+
+    curate = sub.add_parser("curate", help="Curate coded pool and downgrade clearly off-topic papers to D")
+    _add_project_args(curate)
+    curate.add_argument("--apply", action="store_true", help="Also overwrite paper_pool_coded.csv with curated tier/score values.")
+    curate.add_argument("--include-keyword", action="append", default=[], help="Extra positive domain keyword or comma-separated keywords.")
+    curate.add_argument("--exclude-keyword", action="append", default=[], help="Extra off-topic keyword or comma-separated keywords.")
+    curate.add_argument("--min-positive-hits", type=int, default=1)
 
     sync = sub.add_parser("sync-zotero", help="Write generated reading cards back to Zotero notes")
     _add_project_args(sync)
@@ -68,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-chars", type=int, default=12000)
     run.add_argument("--use-deepxiv", action="store_true")
     run.add_argument("--insert-zotero-notes", action="store_true")
+    run.add_argument("--no-local-pdfs", action="store_true", help="Do not add project-local PDF text to reading context.")
+    run.add_argument("--pdf-max-pages", type=int, default=12)
     run.add_argument("--model")
     return parser
 
@@ -210,6 +258,9 @@ def main() -> None:
                     max_chars=args.max_chars,
                     use_deepxiv=args.use_deepxiv,
                     insert_zotero_notes=args.insert_zotero_notes,
+                    use_local_pdfs=not args.no_local_pdfs,
+                    pdf_max_pages=args.pdf_max_pages,
+                    paper_ids=tuple(args.paper_id),
                 ),
             )
         )
@@ -219,6 +270,84 @@ def main() -> None:
         _, _, ai, _ = _settings_and_clients(args, need_ai=True)
         service = LiteratureReviewService(ai=ai)
         _print_result(service.draft_review(_project(args), locale=args.locale))
+        return
+
+    if args.command == "qc":
+        service = LiteratureReviewService()
+        _print_result(service.qc_review(_project(args), ReviewQCOptions(draft_path=args.draft_path)))
+        return
+
+    if args.command == "matrix":
+        service = LiteratureReviewService()
+        include_tiers = tuple(args.include_tier) if args.include_tier else ("A", "B", "C")
+        _print_result(service.build_matrices(_project(args), ReviewMatrixOptions(include_tiers=include_tiers)))
+        return
+
+    if args.command == "verify":
+        storage_dir = Path(args.storage_dir).expanduser() if args.storage_dir else None
+        zotero = None
+        if not args.skip_zotero:
+            settings, zotero, _, _ = _settings_and_clients(args)
+            storage_dir = storage_dir or settings.zotero.storage_dir
+        service = LiteratureReviewService(zotero=zotero)
+        include_tiers = tuple(args.include_tier) if args.include_tier else ("A", "B")
+        _print_result(
+            service.verify_fulltext(
+                _project(args),
+                ReviewVerifyOptions(
+                    include_tiers=include_tiers,
+                    check_zotero=not args.skip_zotero,
+                    storage_dir=storage_dir,
+                ),
+            )
+        )
+        return
+
+    if args.command == "fetch-pdfs":
+        settings = None
+        zotero = None
+        if args.attach_zotero:
+            settings, zotero, _, _ = _settings_and_clients(args)
+        else:
+            try:
+                from paperpilot.utils.env import load_dotenv_if_present
+
+                load_dotenv_if_present(".env")
+            except Exception:
+                pass
+        email = args.unpaywall_email or os.environ.get("UNPAYWALL_EMAIL")
+        include_tiers = tuple(args.include_tier) if args.include_tier else ("A", "B")
+        output_dir = Path(args.output_dir).expanduser() if args.output_dir else None
+        service = LiteratureReviewService(zotero=zotero, open_access=OpenAccessClient(email=email))
+        _print_result(
+            service.fetch_open_access_pdfs(
+                _project(args),
+                ReviewFetchPdfOptions(
+                    include_tiers=include_tiers,
+                    email=email,
+                    output_dir=output_dir,
+                    attach_zotero=args.attach_zotero,
+                    dry_run=args.dry_run,
+                    force=args.force,
+                    limit=args.limit,
+                ),
+            )
+        )
+        return
+
+    if args.command == "curate":
+        service = LiteratureReviewService()
+        _print_result(
+            service.curate_coded_pool(
+                _project(args),
+                ReviewCurateOptions(
+                    apply=args.apply,
+                    include_keywords=_keyword_args(args.include_keyword),
+                    exclude_keywords=_keyword_args(args.exclude_keyword),
+                    min_positive_hits=args.min_positive_hits,
+                ),
+            )
+        )
         return
 
     if args.command == "sync-zotero":
@@ -234,12 +363,7 @@ def main() -> None:
         results = [service.init_project(project)]
 
         if args.watch_query or args.topic:
-            watch_deepxiv = deepxiv
-            if watch_deepxiv is None:
-                try:
-                    watch_deepxiv = DeepXivClient()
-                except Exception:
-                    watch_deepxiv = None
+            watch_deepxiv = deepxiv if args.use_deepxiv else None
             watch = WatchService(zotero=zotero, deepxiv=watch_deepxiv)
             watch_result = watch.search_and_import(
                 WatchOptions(
@@ -275,6 +399,8 @@ def main() -> None:
                     max_chars=args.max_chars,
                     use_deepxiv=args.use_deepxiv,
                     insert_zotero_notes=args.insert_zotero_notes,
+                    use_local_pdfs=not args.no_local_pdfs,
+                    pdf_max_pages=args.pdf_max_pages,
                 ),
             )
         )
@@ -283,6 +409,13 @@ def main() -> None:
         return
 
     parser.print_help()
+
+
+def _keyword_args(values: list[str]) -> tuple[str, ...]:
+    keywords: list[str] = []
+    for value in values or []:
+        keywords.extend(part.strip() for part in value.split(",") if part.strip())
+    return tuple(keywords)
 
 
 if __name__ == "__main__":

@@ -3,27 +3,77 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from paperpilot.clients.arxiv import ArxivClient
+import requests
+
+from paperpilot.clients.arxiv import ArxivClient, _build_search_query
+
+
+ARXIV_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/2504.00001v1</id>
+    <published>2026-04-01T00:00:00Z</published>
+    <title>Test Paper via arXiv</title>
+    <summary>This is a test abstract.</summary>
+    <author><name>Alice Example</name></author>
+    <author><name>Bob Example</name></author>
+    <link href="http://arxiv.org/abs/2504.00001v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2504.00001v1" rel="related" type="application/pdf"/>
+    <arxiv:doi>10.48550/arXiv.2504.00001</arxiv:doi>
+  </entry>
+</feed>
+"""
+
+
+class FakeResponse:
+    text = ARXIV_ATOM
 
 
 class ArxivClientTest(unittest.TestCase):
-    def test_search_returns_list(self):
+    def test_build_search_query_uses_keywords_for_plain_text(self):
+        self.assertEqual(
+            _build_search_query("active exploration with world models in embodied AI"),
+            "all:active AND all:exploration AND all:world AND all:models AND all:embodied AND all:ai",
+        )
+        self.assertEqual(
+            _build_search_query("all:active AND all:exploration"),
+            "all:active AND all:exploration",
+        )
+
+    @patch("paperpilot.clients.arxiv.request_with_retry", return_value=FakeResponse())
+    def test_search_returns_list(self, _request):
         """ArxivClient.search should return a list of paper dicts."""
         client = ArxivClient()
-        # Use a very specific query that should return results
         results = client.search("large language model", limit=3)
         self.assertIsInstance(results, list)
-        # arXiv API usually returns results for this query
-        if results:
-            first = results[0]
-            self.assertIn("title", first)
-            self.assertIn("arxiv_id", first)
+        first = results[0]
+        self.assertEqual(first["title"], "Test Paper via arXiv")
+        self.assertEqual(first["arxiv_id"], "2504.00001v1")
+        self.assertEqual(first["authors"], ["Alice Example", "Bob Example"])
+        self.assertEqual(first["doi"], "10.48550/arXiv.2504.00001")
 
-    def test_search_recent_returns_list(self):
+    @patch("paperpilot.clients.arxiv.request_with_retry", return_value=FakeResponse())
+    def test_search_recent_returns_list(self, _request):
         """ArxivClient.search_recent should return recent papers."""
         client = ArxivClient()
         results = client.search_recent("transformer", limit=2, days=30)
         self.assertIsInstance(results, list)
+        self.assertEqual(results[0]["title"], "Test Paper via arXiv")
+
+    @patch(
+        "paperpilot.clients.arxiv.request_with_retry",
+        side_effect=[requests.exceptions.SSLError("transient EOF"), FakeResponse()],
+    )
+    def test_search_retries_transient_request_failures(self, request):
+        client = ArxivClient()
+        results = client.search_recent("active exploration with world models in embodied AI", limit=2)
+
+        self.assertEqual(results[0]["title"], "Test Paper via arXiv")
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(
+            request.call_args_list[0].kwargs["params"]["search_query"],
+            "all:active AND all:exploration AND all:world AND all:models AND all:embodied AND all:ai",
+        )
 
 
 class WatchServiceArxivFallbackTest(unittest.TestCase):

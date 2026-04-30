@@ -33,13 +33,13 @@ class PipelineOrchestrator:
         )
         self.arxiv = ArxivClient()
 
-        # DeepXiv: try to init, but don't fail if unavailable — arXiv is the fallback
+        # DeepXiv is opt-in for summary enrichment; watch defaults to arXiv only.
         self.deepxiv: DeepXivClient | None = None
-        if config.summary.use_deepxiv or config.watch.enabled:
+        if config.summary.use_deepxiv:
             try:
                 self.deepxiv = DeepXivClient()
             except Exception:
-                pass  # arXiv fallback will be used
+                pass
 
         self.watch_service = WatchService(
             zotero=self.zotero,

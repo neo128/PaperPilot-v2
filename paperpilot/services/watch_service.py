@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -148,12 +149,14 @@ class WatchService:
         self.zotero = zotero
         self.deepxiv = deepxiv
         self.arxiv = arxiv or ArxivClient()
+        self._deepxiv_unavailable = False
+        self._arxiv_unavailable = False
 
     def _search_candidates_for_query(self, query: str, limit: int) -> tuple[List[Dict[str, Any]], str]:
         candidates: List[Dict[str, Any]] = []
         source = "unknown"
 
-        if self.deepxiv:
+        if self.deepxiv and not self._deepxiv_unavailable:
             try:
                 response = self.deepxiv.search(query, limit=limit)
                 if isinstance(response, dict):
@@ -167,14 +170,16 @@ class WatchService:
                 else:
                     logger.info("watch: DeepXiv returned empty results for query=%s, falling back to arXiv", query)
             except Exception as exc:
+                self._deepxiv_unavailable = True
                 logger.warning("watch: DeepXiv failed for query=%s (%s), falling back to arXiv", query, exc)
 
-        if not candidates:
+        if not candidates and not self._arxiv_unavailable:
             try:
                 candidates = self.arxiv.search_recent(query, limit=limit)
                 source = "arxiv"
                 logger.info("watch: arXiv returned %d results for query=%s", len(candidates), query)
             except Exception as exc:
+                self._arxiv_unavailable = True
                 logger.error("watch: arXiv fallback also failed for query=%s (%s)", query, exc)
                 source = "none"
 
@@ -221,9 +226,12 @@ class WatchService:
             if options.expand_queries
             else [options.query.strip()]
         )
+        per_query_limit = options.limit
+        if options.expand_queries and len(queries) > 1:
+            per_query_limit = max(1, math.ceil(options.limit / len(queries)))
 
         for query in queries:
-            query_candidates, source = self._search_candidates_for_query(query, options.limit)
+            query_candidates, source = self._search_candidates_for_query(query, per_query_limit)
             candidates.extend(query_candidates)
             if query_candidates and source != "none":
                 sources.append(source)
@@ -231,7 +239,7 @@ class WatchService:
         if options.journals:
             try:
                 for query in queries:
-                    journal_results = search_journals(query, limit=options.limit)
+                    journal_results = search_journals(query, limit=per_query_limit)
                     if journal_results:
                         logger.info("watch: journals returned %d results for query=%s", len(journal_results), query)
                         candidates.extend(journal_results)
@@ -241,8 +249,13 @@ class WatchService:
 
         if not candidates:
             result.artifacts["source"] = "none"
-            result.artifacts["error"] = "Both DeepXiv and arXiv returned no results"
+            result.artifacts["error"] = (
+                "DeepXiv and arXiv returned no results"
+                if self.deepxiv is not None
+                else "arXiv returned no results"
+            )
             result.artifacts["queries"] = queries
+            result.artifacts["per_query_limit"] = per_query_limit
             return result
 
         source = "+".join(dict.fromkeys(sources)) if sources else "unknown"
@@ -277,6 +290,7 @@ class WatchService:
             result.artifacts["dry_run_count"] = len(payloads)
             result.artifacts["source"] = source
             result.artifacts["queries"] = queries
+            result.artifacts["per_query_limit"] = per_query_limit
             result.artifacts["existing_keys"] = existing_keys
             result.artifacts["managed_keys"] = managed_keys
             return result
@@ -289,4 +303,5 @@ class WatchService:
         result.artifacts["managed_keys"] = managed_keys
         result.artifacts["source"] = source
         result.artifacts["queries"] = queries
+        result.artifacts["per_query_limit"] = per_query_limit
         return result

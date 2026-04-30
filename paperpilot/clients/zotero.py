@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -80,10 +81,11 @@ class ZoteroClient:
         api_key: str,
         use_env_proxy: bool = True,
         user_agent: str = "PaperPilot-v2/0.1",
-        timeout: int = 30,
+        timeout: int = 8,
     ) -> None:
         self.base = f"https://api.zotero.org/users/{user_id}"
         self.timeout = timeout
+        self._search_unavailable_until = 0.0
         self._proxy_disabled = not use_env_proxy
         self.session = create_session(
             headers={"Zotero-API-Key": api_key, "User-Agent": user_agent},
@@ -193,6 +195,9 @@ class ZoteroClient:
 
     def find_existing_item(self, candidate: Dict[str, Any], limit: int = 25) -> Optional[Dict[str, Any]]:
         """Find an existing Zotero top-level item by DOI, arXiv id, or exact normalized title."""
+        if time.time() < self._search_unavailable_until:
+            return None
+
         terms: List[str] = []
         doi = _normalize_doi(candidate.get("doi") or candidate.get("DOI"))
         if doi:
@@ -214,7 +219,8 @@ class ZoteroClient:
             try:
                 matches = self.search_items(term, limit=limit, top_only=True)
             except Exception:
-                continue
+                self._search_unavailable_until = time.time() + 300
+                return None
             for entry in matches:
                 if _entry_matches_candidate(entry, candidate):
                     return entry

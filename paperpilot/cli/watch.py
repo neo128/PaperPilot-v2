@@ -28,13 +28,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", help="Additional review prompt used when expanding literature-search query groups.")
     parser.add_argument("--expand-queries", action="store_true", help="Expand the topic into Phase-1 query groups such as benchmark/survey/dataset/system.")
     parser.add_argument("--no-reuse-existing", action="store_true", help="Create Zotero items without checking whether matching items already exist.")
+    parser.add_argument("--use-deepxiv", action="store_true", help="Use DeepXiv before arXiv. Defaults to arXiv only.")
     return parser.parse_args(_cli_args())
 
 
 def main() -> None:
     args = parse_args()
     settings = load_app_settings()
-    deepxiv = DeepXivClient()
+    deepxiv = DeepXivClient() if args.use_deepxiv else None
     zotero = ZoteroClient(settings.zotero.user_id, settings.zotero.api_key)
     service = WatchService(zotero=zotero, deepxiv=deepxiv)
     result = service.search_and_import(

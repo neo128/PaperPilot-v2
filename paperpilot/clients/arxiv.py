@@ -4,13 +4,30 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import time
 from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree as ET
+
+import requests
 
 from paperpilot.utils.http import create_session, request_with_retry
 
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 ARXIV_NS = "{http://arxiv.org/schemas/atom}"
+ARXIV_QUERY_FIELDS_RE = re.compile(r"\b(?:all|ti|au|abs|cat|id|doi|jr|co|rn):|\b(?:AND|OR|ANDNOT)\b", re.I)
+ARXIV_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
 
 
 def _parse_arxiv_id(entry: ET.Element) -> Optional[str]:
@@ -81,35 +98,83 @@ def _entry_to_dict(entry: ET.Element) -> Dict[str, Any]:
     }
 
 
+def _build_search_query(query: str, *, max_terms: int = 7) -> str:
+    """Convert plain-language input to an arXiv API query.
+
+    arXiv treats ``all:"long natural language topic"`` as an exact phrase,
+    which is too strict for review topics. For plain text, use a compact
+    AND query over meaningful terms while preserving explicit arXiv syntax.
+    """
+    raw = query.strip()
+    if not raw:
+        return "all:paper"
+    if ARXIV_QUERY_FIELDS_RE.search(raw):
+        return raw
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", raw.lower()):
+        if token in ARXIV_STOPWORDS or len(token) < 2:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+        if len(terms) >= max_terms:
+            break
+
+    if not terms:
+        return f'all:"{raw}"'
+    return " AND ".join(f"all:{term}" for term in terms)
+
+
 class ArxivClient:
     """Thin wrapper around the arXiv public API (no auth required)."""
 
     BASE_URL = "https://export.arxiv.org/api/query"
 
-    def __init__(self, timeout: int = 30, max_results: int = 30) -> None:
+    def __init__(self, timeout: int = 12, max_results: int = 30) -> None:
         self.timeout = timeout
         self.max_results = max_results
-        self.session = create_session(
-            headers={"User-Agent": "PaperPilot-v2/0.1 (https://github.com/neo128/PaperPilot)"}
+        self.user_agents = (
+            "PaperPilot-v2/0.1 (mailto:admin@example.com)",
+            f"python-requests/{requests.__version__}",
         )
+        self.session = self._new_session(self.user_agents[0])
+
+    def _new_session(self, user_agent: str) -> requests.Session:
+        return create_session(headers={"User-Agent": user_agent})
+
+    def _request(self, params: Dict[str, Any]) -> requests.Response:
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            self.session = self._new_session(self.user_agents[attempt % len(self.user_agents)])
+            try:
+                return request_with_retry(
+                    self.session,
+                    "get",
+                    self.BASE_URL,
+                    params=params,
+                    timeout=self.timeout,
+                    retries=1,
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                time.sleep(0.5 * (attempt + 1))
+        assert last_exc is not None
+        raise last_exc
 
     def search(self, query: str, limit: int = 10, sort_by: str = "submittedDate") -> List[Dict[str, Any]]:
         """Search arXiv and return a list of paper dicts compatible with watch_service."""
-        q = query.strip()
-        if " " in q:
-            q = f'all:"{q}"'
-        else:
-            q = f"all:{q}"
-
         params = {
-            "search_query": q,
+            "search_query": _build_search_query(query),
             "start": 0,
             "max_results": min(limit, self.max_results),
             "sortBy": sort_by,
             "sortOrder": "descending",
         }
 
-        resp = request_with_retry(self.session, "get", self.BASE_URL, params=params, timeout=self.timeout)
+        resp = self._request(params)
         root = ET.fromstring(resp.text)
         entries = root.findall(f"{ATOM_NS}entry")
 
@@ -125,21 +190,15 @@ class ArxivClient:
         arXiv's date range filter is unreliable (frequent 500 errors), so we rely on
         sortBy=submittedDate which naturally returns the newest papers first.
         """
-        q = query.strip()
-        if " " in q:
-            q = f'all:"{q}"'
-        else:
-            q = f"all:{q}"
-
         params = {
-            "search_query": q,
+            "search_query": _build_search_query(query),
             "start": 0,
             "max_results": min(limit, self.max_results),
             "sortBy": "submittedDate",
             "sortOrder": "descending",
         }
 
-        resp = request_with_retry(self.session, "get", self.BASE_URL, params=params, timeout=self.timeout)
+        resp = self._request(params)
         root = ET.fromstring(resp.text)
         entries = root.findall(f"{ATOM_NS}entry")
 

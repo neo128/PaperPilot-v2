@@ -7,6 +7,7 @@ then returns candidates in the same dict shape expected by build_zotero_item.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -50,9 +51,13 @@ S2_RATE_DELAY = 0.25  # seconds between S2 requests to stay well under 100 req/5
 S2_RATE_LIMIT_COOLDOWN = 300  # seconds to skip S2 after a rate-limit response
 _S2_RATE_LIMITED_UNTIL = 0.0
 _S2_RATE_LIMIT_NOTICE_EMITTED = False
+_S2_TRANSPORT_FAILED_UNTIL = 0.0
 
 CR_BASE = "https://api.crossref.org/works"
 CR_RATE_DELAY = 0.15  # polite pool rate
+CR_TRANSPORT_COOLDOWN = 300
+CR_TIMEOUT = 5
+_CR_TRANSPORT_FAILED_UNTIL = 0.0
 
 USER_AGENT = "PaperPilot-v2/0.1 (paper retrieval; mailto:admin@example.com)"
 
@@ -63,7 +68,10 @@ USER_AGENT = "PaperPilot-v2/0.1 (paper retrieval; mailto:admin@example.com)"
 
 def _s2_search(query: str, venue_names: List[str], limit: int) -> List[Dict[str, Any]]:
     """Search S2 with venue name(s) AND query keyword, then post-filter by venue string."""
-    global _S2_RATE_LIMIT_NOTICE_EMITTED, _S2_RATE_LIMITED_UNTIL
+    global _S2_RATE_LIMIT_NOTICE_EMITTED, _S2_RATE_LIMITED_UNTIL, _S2_TRANSPORT_FAILED_UNTIL
+    if time.time() < _S2_TRANSPORT_FAILED_UNTIL:
+        logger.debug("S2 transport cooldown active, skipping S2 for query=%s", query)
+        return []
     if time.time() < _S2_RATE_LIMITED_UNTIL:
         logger.debug("S2 rate-limit cooldown active, skipping S2 for query=%s", query)
         return []
@@ -84,11 +92,11 @@ def _s2_search(query: str, venue_names: List[str], limit: int) -> List[Dict[str,
     }
 
     try:
-        resp = requests.get(url, params=params, timeout=30, headers={"User-Agent": USER_AGENT})
+        resp = requests.get(url, params=params, timeout=CR_TIMEOUT, headers={"User-Agent": USER_AGENT})
         if resp.status_code == 429:
             logger.debug("S2 rate limited, waiting and retrying once")
             time.sleep(2)
-            resp = requests.get(url, params=params, timeout=30, headers={"User-Agent": USER_AGENT})
+            resp = requests.get(url, params=params, timeout=CR_TIMEOUT, headers={"User-Agent": USER_AGENT})
             if resp.status_code == 429:
                 _S2_RATE_LIMITED_UNTIL = time.time() + S2_RATE_LIMIT_COOLDOWN
                 if not _S2_RATE_LIMIT_NOTICE_EMITTED:
@@ -102,6 +110,7 @@ def _s2_search(query: str, venue_names: List[str], limit: int) -> List[Dict[str,
             return []
         data = resp.json() or {}
     except Exception as exc:
+        _S2_TRANSPORT_FAILED_UNTIL = time.time() + S2_RATE_LIMIT_COOLDOWN
         logger.warning("S2 search failed: %s", exc)
         return []
 
@@ -170,6 +179,11 @@ def _s2_search(query: str, venue_names: List[str], limit: int) -> List[Dict[str,
 
 def _cr_search(query: str, containers: List[str], limit: int) -> List[Dict[str, Any]]:
     """Search CrossRef for papers whose container-title matches known venue names."""
+    global _CR_TRANSPORT_FAILED_UNTIL
+    if time.time() < _CR_TRANSPORT_FAILED_UNTIL:
+        logger.debug("CrossRef transport cooldown active, skipping CrossRef for query=%s", query)
+        return []
+
     results: List[Dict[str, Any]] = []
     seen_titles: set[str] = set()
 
@@ -187,18 +201,19 @@ def _cr_search(query: str, containers: List[str], limit: int) -> List[Dict[str, 
         headers = {"User-Agent": USER_AGENT}
 
         try:
-            resp = requests.get(url, params=params, timeout=20, headers=headers)
+            resp = requests.get(url, params=params, timeout=CR_TIMEOUT, headers=headers)
             if resp.status_code == 429:
                 # Respect Retry-After if present
                 retry_after = resp.headers.get("Retry-After", "1")
                 time.sleep(int(retry_after))
-                resp = requests.get(url, params=params, timeout=20, headers=headers)
+                resp = requests.get(url, params=params, timeout=CR_TIMEOUT, headers=headers)
             if resp.status_code != 200:
                 continue
             msg = (resp.json() or {}).get("message", {})
         except Exception as exc:
+            _CR_TRANSPORT_FAILED_UNTIL = time.time() + CR_TRANSPORT_COOLDOWN
             logger.debug("CrossRef search failed for container=%s: %s", container, exc)
-            continue
+            break
 
         items = msg.get("items") or []
         for item in items:
@@ -270,6 +285,11 @@ def search_journals(
 
     logger.info("journals: searching S2 for query=%s limit=%d venues=%s", query, limit, venue_subset or "all")
     s2_results = _s2_search(query, venue_names, limit)
+
+    crossref_enabled = os.environ.get("PAPERPILOT_ENABLE_CROSSREF") == "1"
+    if not crossref_enabled:
+        logger.debug("journals: CrossRef disabled; set PAPERPILOT_ENABLE_CROSSREF=1 to enable it")
+        return s2_results[:limit]
 
     logger.info("journals: searching CrossRef for query=%s limit=%d", query, limit)
     cr_results = _cr_search(query, containers, limit)
