@@ -44,6 +44,16 @@ class FakeAI:
         return "# Review Draft\n\nThis is a fake draft."
 
 
+class InvalidCodingAI(FakeAI):
+    def code_paper_for_review(self, **kwargs):
+        return {
+            "priority_score": "120",
+            "tier": "Z",
+            "core_contribution": "A partial contribution.",
+            "coding_note": "partial coding",
+        }
+
+
 class FakeZotero:
     def __init__(self):
         self.notes = []
@@ -118,9 +128,52 @@ class LiteratureReviewServiceTest(unittest.TestCase):
             self.assertEqual(result.processed, 3)
             self.assertEqual(result.created, 2)
             self.assertEqual(result.skipped, 1)
-            csv_text = (project.path / "data/processed/paper_pool_verified.csv").read_text(encoding="utf-8")
+            csv_path = project.path / "data/processed/paper_pool_verified.csv"
+            csv_text = csv_path.read_text(encoding="utf-8")
             self.assertIn("Same Paper", csv_text)
             self.assertIn("Different Paper", csv_text)
+            with csv_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertIn("dedupe_key", rows[0])
+            self.assertIn("screening_decision", rows[0])
+            self.assertIn("relevance_score", rows[0])
+            self.assertEqual(rows[0]["dedupe_key"], "doi:10.123/test")
+            self.assertEqual(rows[1]["dedupe_key"], "arxiv:2501.00001")
+
+    def test_build_pool_adds_screening_metadata_and_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            service = LiteratureReviewService()
+            items = [
+                zotero_item(
+                    "A",
+                    "Agent Memory Benchmark for Long-Term Agents",
+                    arxiv_id="2501.00001",
+                    abstract="This benchmark evaluates agent memory systems for long-term autonomous agents.",
+                ),
+                zotero_item(
+                    "B",
+                    "Clinical RNA Policy Report",
+                    doi="10.123/clinical",
+                    abstract="A clinical RNA policy report unrelated to autonomous agent memory.",
+                ),
+            ]
+
+            result = service.build_pool_from_zotero_items(project, items)
+
+            self.assertEqual(result.created, 2)
+            with (project.path / "data/processed/paper_pool_verified.csv").open(encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[0]["screening_decision"], "include_for_reading")
+            self.assertEqual(rows[0]["topic_relevance"], "likely_relevant")
+            self.assertEqual(rows[0]["fulltext_status"], "open_access_candidate")
+            self.assertIn("topic_hits", rows[0]["screening_reason"])
+            self.assertEqual(rows[1]["screening_decision"], "needs_manual_screening")
+            self.assertIn("negative_hits", rows[1]["screening_reason"])
+            report = (project.path / "reports/paper_pool_verification_report.md").read_text(encoding="utf-8")
+            self.assertIn("Screening Decision Counts", report)
+            self.assertIn("Fulltext Status Counts", report)
+            self.assertIn("Manual Screening Queue", report)
 
     def test_read_code_draft_and_sync(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,6 +195,25 @@ class LiteratureReviewServiceTest(unittest.TestCase):
             self.assertTrue((project.path / "data/processed/paper_pool_coded.csv").exists())
             self.assertTrue((project.path / "reports/review_draft.md").exists())
             self.assertGreaterEqual(len(zotero.notes), 2)
+
+    def test_read_and_code_marks_invalid_ai_coding_for_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            service = LiteratureReviewService(ai=InvalidCodingAI())
+            service.build_pool_from_zotero_items(project, [zotero_item("A", "Paper A", doi="10.123/a")])
+
+            result = service.read_and_code(project, ReviewReadOptions(limit=1))
+
+            self.assertEqual(result.created, 1)
+            with (project.path / "data/processed/paper_pool_coded.csv").open(encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[0]["status"], "needs_review")
+            self.assertEqual(rows[0]["priority_score"], "100")
+            self.assertEqual(rows[0]["tier"], "A 核心池")
+            self.assertEqual(rows[0]["coding_confidence"], "needs_verification")
+            self.assertIn("priority_score_out_of_range", rows[0]["coding_note"])
+            self.assertIn("invalid_tier", rows[0]["coding_note"])
+            self.assertIn("missing_research_direction", rows[0]["coding_note"])
 
     def test_curate_coded_pool_downgrades_off_topic(self):
         with tempfile.TemporaryDirectory() as tmp:

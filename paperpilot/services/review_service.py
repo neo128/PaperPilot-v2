@@ -30,9 +30,15 @@ PAPER_POOL_FIELDS = [
     "dataset_url",
     "doi",
     "arxiv_id",
+    "source",
+    "dedupe_key",
     "source_quality",
     "verification_status",
+    "fulltext_status",
+    "relevance_score",
     "topic_relevance",
+    "screening_decision",
+    "screening_reason",
     "reason_to_include",
     "reason_to_exclude_or_downgrade",
     "notes",
@@ -68,6 +74,23 @@ CODED_POOL_FIELDS = [
     "reading_card",
     "status",
 ]
+
+CODED_REQUIRED_AI_FIELDS = [
+    "research_direction",
+    "task_type",
+    "method_type",
+    "core_contribution",
+    "evidence_strength",
+    "relation_to_target_topic",
+    "coding_confidence",
+]
+
+CANONICAL_TIERS = {
+    "A": "A 核心池",
+    "B": "B 主体池",
+    "C": "C 备选池",
+    "D": "D 存档池",
+}
 
 
 CURATED_POOL_FIELDS = CODED_POOL_FIELDS + [
@@ -396,6 +419,58 @@ def _tier_from_score(score: int) -> str:
     return "D 存档池"
 
 
+def _normalize_priority_score(value: Any, default_score: int) -> tuple[int, list[str]]:
+    issues: list[str] = []
+    try:
+        score = int(float(value))
+    except (TypeError, ValueError):
+        issues.append("invalid_priority_score")
+        return default_score, issues
+    if score < 0 or score > 100:
+        issues.append("priority_score_out_of_range")
+        score = max(0, min(100, score))
+    return score, issues
+
+
+def _normalize_tier(value: Any, score: int) -> tuple[str, list[str]]:
+    issues: list[str] = []
+    text = str(value or "").strip()
+    rank = text[:1].upper()
+    if rank in CANONICAL_TIERS:
+        return CANONICAL_TIERS[rank], issues
+    if text:
+        issues.append("invalid_tier")
+    else:
+        issues.append("missing_tier")
+    return _tier_from_score(score), issues
+
+
+def _normalize_coding_confidence(value: Any) -> tuple[str, list[str]]:
+    issues: list[str] = []
+    text = str(value or "").strip().lower()
+    if not text:
+        return "needs_verification", ["missing_coding_confidence"]
+    if text in {"high", "medium", "low", "needs_verification"}:
+        return text, issues
+    if text in {"高", "高置信", "high confidence"}:
+        return "high", issues
+    if text in {"中", "中等", "medium confidence"}:
+        return "medium", issues
+    if text in {"低", "低置信", "low confidence"}:
+        return "low", issues
+    issues.append("invalid_coding_confidence")
+    return "needs_verification", issues
+
+
+def _coding_validation_issues(code_data: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    for field in CODED_REQUIRED_AI_FIELDS:
+        value = code_data.get(field)
+        if value is None or str(value).strip() == "":
+            issues.append(f"missing_{field}")
+    return issues
+
+
 def _topic_keywords(topic: str) -> list[str]:
     phrases: list[str] = []
     topic_lower = topic.lower()
@@ -424,6 +499,153 @@ def _keyword_hits(text: str, keywords: Iterable[str]) -> list[str]:
         seen.add(key)
         if _contains_keyword(text, key):
             out.append(key)
+    return out
+
+
+def _topic_terms(topic: str) -> list[str]:
+    text = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", " ", topic or "").lower()
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "for",
+        "in",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+        "review",
+        "survey",
+        "systematic",
+        "literature",
+        "taxonomy",
+    }
+    terms: list[str] = []
+    phrase = " ".join(text.split())
+    if phrase:
+        terms.append(phrase)
+    for token in phrase.split():
+        if len(token) >= 3 and token not in stopwords:
+            terms.append(token)
+    return list(dict.fromkeys(terms))
+
+
+def _dedupe_key_for_pool_row(row: dict[str, Any]) -> str:
+    doi = row.get("doi") or ""
+    arxiv_id = row.get("arxiv_id") or ""
+    title = _normalize_title(row.get("title"))
+    if doi:
+        return f"doi:{doi}"
+    if arxiv_id:
+        return f"arxiv:{arxiv_id}"
+    if title:
+        return f"title:{title}"
+    return ""
+
+
+def _infer_pool_source(data: dict[str, Any], doi: str, arxiv_id: str) -> str:
+    tags = {str(tag.get("tag") or "").lower() for tag in data.get("tags") or [] if isinstance(tag, dict)}
+    archive = str(data.get("archive") or "").lower()
+    url = str(data.get("url") or "").lower()
+    if "paperpilot-v2" in tags:
+        if arxiv_id:
+            return "zotero:paperpilot:arxiv"
+        if doi:
+            return "zotero:paperpilot:doi"
+        return "zotero:paperpilot"
+    if arxiv_id or archive == "arxiv" or "arxiv.org" in url:
+        return "zotero:arxiv"
+    if doi:
+        return "zotero:doi"
+    return "zotero:manual"
+
+
+def _infer_fulltext_status(row: dict[str, Any]) -> str:
+    if row.get("arxiv_id") or row.get("arxiv_url"):
+        return "open_access_candidate"
+    if row.get("doi"):
+        return "needs_oa_lookup"
+    if row.get("paper_url") or row.get("official_url"):
+        return "needs_url_check"
+    return "metadata_only"
+
+
+def _screen_pool_row(project: ReviewProject, row: dict[str, Any]) -> dict[str, Any]:
+    text = " ".join(
+        str(row.get(field, ""))
+        for field in [
+            "title",
+            "abstract",
+            "venue",
+            "authors",
+            "paper_url",
+            "official_url",
+            "project_url",
+            "code_url",
+            "dataset_url",
+        ]
+    ).lower()
+    title_text = str(row.get("title") or "").lower()
+    topic_terms = _topic_terms(project.topic)
+    topic_hits = _keyword_hits(text, topic_terms)
+    title_hits = _keyword_hits(title_text, topic_terms)
+    negative_hits = _keyword_hits(text, DEFAULT_CURATE_EXCLUDE_KEYWORDS)
+
+    score = 25
+    if row.get("source_quality") == "primary":
+        score += 15
+    if row.get("abstract"):
+        score += 10
+    if row.get("year"):
+        score += 5
+    if row.get("venue"):
+        score += 5
+    if topic_hits:
+        score += min(30, 10 * len(topic_hits))
+    if title_hits:
+        score += 15
+    if negative_hits:
+        score -= min(35, 15 * len(negative_hits))
+    score = max(0, min(100, score))
+
+    if negative_hits and not topic_hits:
+        decision = "exclude_candidate"
+        relevance = "low"
+    elif score >= 65:
+        decision = "include_for_reading"
+        relevance = "likely_relevant"
+    elif score >= 40:
+        decision = "needs_manual_screening"
+        relevance = "uncertain"
+    else:
+        decision = "needs_manual_screening"
+        relevance = "low"
+
+    reasons: list[str] = []
+    if topic_hits:
+        reasons.append("topic_hits=" + ",".join(topic_hits[:8]))
+    if title_hits:
+        reasons.append("title_hits=" + ",".join(title_hits[:8]))
+    if negative_hits:
+        reasons.append("negative_hits=" + ",".join(negative_hits[:8]))
+    if row.get("source_quality") == "primary":
+        reasons.append("primary_identifier")
+    if row.get("abstract"):
+        reasons.append("has_abstract")
+    if not reasons:
+        reasons.append("metadata_only_initial_screen")
+
+    out = dict(row)
+    out["relevance_score"] = score
+    out["topic_relevance"] = relevance
+    out["screening_decision"] = decision
+    out["screening_reason"] = "; ".join(reasons)
+    if decision == "include_for_reading":
+        out["reason_to_include"] = out.get("reason_to_include") or out["screening_reason"]
+    if decision == "exclude_candidate":
+        out["reason_to_exclude_or_downgrade"] = out.get("reason_to_exclude_or_downgrade") or out["screening_reason"]
     return out
 
 
@@ -645,6 +867,9 @@ class LiteratureReviewService:
         verified_rows = self._deduplicate_pool_rows(raw_rows)
         for index, row in enumerate(verified_rows, start=1):
             row["paper_id"] = f"P{index:03d}"
+            row["dedupe_key"] = row.get("dedupe_key") or _dedupe_key_for_pool_row(row)
+            row["fulltext_status"] = _infer_fulltext_status(row)
+        verified_rows = [_screen_pool_row(project, row) for row in verified_rows]
 
         _write_csv(project.path / "data/raw/paper_pool_raw.csv", PAPER_POOL_FIELDS, raw_rows)
         _write_csv(project.path / "data/processed/paper_pool_verified.csv", PAPER_POOL_FIELDS, verified_rows)
@@ -1918,7 +2143,7 @@ class LiteratureReviewService:
         year = _extract_year(data.get("date") or data.get("publicationDate") or data.get("issueDate"))
         paper_url = data.get("url") or arxiv_url or (f"https://doi.org/{doi}" if doi else "")
         citation_key = _citation_key(authors, year, str(title))
-        return {
+        row = {
             "paper_id": f"P{index:03d}",
             "zotero_key": entry.get("key") or data.get("key") or "",
             "title": title,
@@ -1934,38 +2159,79 @@ class LiteratureReviewService:
             "dataset_url": "",
             "doi": doi,
             "arxiv_id": arxiv_id,
+            "source": _infer_pool_source(data, doi, arxiv_id),
+            "dedupe_key": "",
             "source_quality": "primary" if doi or arxiv_id else "secondary",
             "verification_status": "partially_verified",
+            "fulltext_status": "",
+            "relevance_score": "",
             "topic_relevance": "needs_review",
+            "screening_decision": "needs_manual_screening",
+            "screening_reason": "",
             "reason_to_include": "",
             "reason_to_exclude_or_downgrade": "",
             "notes": "",
             "citation_key": citation_key,
             "abstract": data.get("abstractNote") or data.get("abstract") or "",
         }
+        row["dedupe_key"] = _dedupe_key_for_pool_row(row)
+        row["fulltext_status"] = _infer_fulltext_status(row)
+        return row
 
     def _deduplicate_pool_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        seen: set[tuple[str, str]] = set()
+        seen: set[str] = set()
         out: list[dict[str, Any]] = []
         for row in rows:
-            doi = row.get("doi") or ""
-            arxiv_id = row.get("arxiv_id") or ""
-            title = _normalize_title(row.get("title"))
-            if doi:
-                key = ("doi", doi)
-            elif arxiv_id:
-                key = ("arxiv", arxiv_id)
-            else:
-                key = ("title", title)
-            if not key[1] or key in seen:
+            dedupe_key = row.get("dedupe_key") or _dedupe_key_for_pool_row(row)
+            row["dedupe_key"] = dedupe_key
+            if not dedupe_key or dedupe_key in seen:
                 continue
-            seen.add(key)
+            seen.add(dedupe_key)
             out.append(row)
         return out
 
     def _write_pool_report(self, project: ReviewProject, raw_rows: list[dict[str, Any]], verified_rows: list[dict[str, Any]]) -> None:
         venues = sorted({row.get("venue") for row in verified_rows if row.get("venue")})
         years = sorted({row.get("year") for row in verified_rows if row.get("year")})
+        source_counts = Counter(row.get("source") or "unknown" for row in verified_rows)
+        decision_counts = Counter(row.get("screening_decision") or "unknown" for row in verified_rows)
+        relevance_counts = Counter(row.get("topic_relevance") or "unknown" for row in verified_rows)
+        fulltext_counts = Counter(row.get("fulltext_status") or "unknown" for row in verified_rows)
+        dedupe_counts = Counter(row.get("dedupe_key") or _dedupe_key_for_pool_row(row) for row in raw_rows)
+        duplicate_keys = [(key, count) for key, count in dedupe_counts.items() if key and count > 1]
+        scored_rows = [
+            row
+            for row in verified_rows
+            if str(row.get("relevance_score") or "").isdigit()
+        ]
+        score_values = [int(row.get("relevance_score")) for row in scored_rows]
+        avg_score = round(sum(score_values) / len(score_values), 1) if score_values else "n/a"
+        included = [row for row in verified_rows if row.get("screening_decision") == "include_for_reading"]
+        manual = [row for row in verified_rows if row.get("screening_decision") == "needs_manual_screening"]
+        excluded = [row for row in verified_rows if row.get("screening_decision") == "exclude_candidate"]
+
+        def count_lines(counter: Counter[str]) -> str:
+            if not counter:
+                return "- none"
+            return "\n".join(f"- {key}: {count}" for key, count in counter.most_common())
+
+        def row_lines(rows: list[dict[str, Any]], limit: int = 20) -> str:
+            if not rows:
+                return "- none"
+            lines = []
+            for row in rows[:limit]:
+                lines.append(
+                    "- {paper_id}: {title} (score={score}, reason={reason})".format(
+                        paper_id=row.get("paper_id", ""),
+                        title=row.get("title", ""),
+                        score=row.get("relevance_score", ""),
+                        reason=row.get("screening_reason", ""),
+                    )
+                )
+            if len(rows) > limit:
+                lines.append(f"- ... {len(rows) - limit} more")
+            return "\n".join(lines)
+
         content = f"""# Paper Pool Verification Report
 
 ## Topic
@@ -1979,16 +2245,46 @@ class LiteratureReviewService:
 - verified: {len(verified_rows)}
 - duplicates_removed: {max(0, len(raw_rows) - len(verified_rows))}
 
+## Source Counts
+{count_lines(source_counts)}
+
+## Screening Decision Counts
+{count_lines(decision_counts)}
+
+## Topic Relevance Counts
+{count_lines(relevance_counts)}
+
+## Fulltext Status Counts
+{count_lines(fulltext_counts)}
+
+## Relevance Score
+- average: {avg_score}
+- scored_rows: {len(scored_rows)}
+
+## Duplicate Keys Removed
+{row_lines([{"paper_id": key, "title": f"count={count}", "relevance_score": "", "screening_reason": ""} for key, count in duplicate_keys], limit=20)}
+
 ## Venue Coverage
 {", ".join(venues) if venues else "待复核"}
 
 ## Year Coverage
 {", ".join(years) if years else "待复核"}
 
+## Include For Reading
+{row_lines(included)}
+
+## Manual Screening Queue
+{row_lines(manual)}
+
+## Exclude Candidates
+{row_lines(excluded)}
+
 ## Remaining Unverified Items
-- `verification_status=partially_verified` 的条目需要后续人工或自动复核。
+- `screening_decision=needs_manual_screening` 的条目需要人工确认纳入/排除。
+- `fulltext_status` 不是 `open_access_candidate` 的条目需要后续全文获取或人工复核。
 
 ## Next Step
+- 运行 `review fetch-pdfs` 和 `review verify` 补全文状态。
 - 运行 `review read` 生成 AI 精读卡片和编码表。
 """
         (project.path / "reports/paper_pool_verification_report.md").write_text(content, encoding="utf-8")
@@ -2150,16 +2446,31 @@ class LiteratureReviewService:
     def _coded_row_from_ai(self, row: dict[str, str], code_data: dict[str, Any], card_path: Path, status: str) -> dict[str, Any]:
         default = self._default_coded_row(row, card_path, status)
         score_raw = code_data.get("priority_score") or code_data.get("score") or default["priority_score"]
-        try:
-            score = int(float(score_raw))
-        except (TypeError, ValueError):
-            score = int(default["priority_score"])
-        out = {**default, "priority_score": score, "tier": code_data.get("tier") or _tier_from_score(score)}
+        score, validation_issues = _normalize_priority_score(score_raw, int(default["priority_score"]))
+        tier, tier_issues = _normalize_tier(code_data.get("tier"), score)
+        confidence, confidence_issues = _normalize_coding_confidence(code_data.get("coding_confidence"))
+        validation_issues.extend(tier_issues)
+        validation_issues.extend(confidence_issues)
+        validation_issues.extend(_coding_validation_issues(code_data))
+        validation_issues = list(dict.fromkeys(validation_issues))
+
+        out_status = "needs_review" if validation_issues else status
+        out = {
+            **default,
+            "priority_score": score,
+            "tier": tier,
+            "coding_confidence": confidence,
+            "status": out_status,
+        }
         for field in CODED_POOL_FIELDS:
-            if field in {"paper_id", "zotero_key", "title", "year", "venue", "citation_key", "priority_score", "tier", "reading_card", "status"}:
+            if field in {"paper_id", "zotero_key", "title", "year", "venue", "citation_key", "priority_score", "tier", "coding_confidence", "reading_card", "status"}:
                 continue
             if field in code_data:
                 out[field] = code_data.get(field, "")
+        if validation_issues:
+            note = str(out.get("coding_note") or "").strip()
+            validation_note = "validation_issues=" + ",".join(validation_issues)
+            out["coding_note"] = f"{note}; {validation_note}" if note else validation_note
         return out
 
     def _format_reading_card(self, topic: str, row: dict[str, str], reading_md: str, code_data: dict[str, Any]) -> str:

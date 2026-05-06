@@ -203,6 +203,8 @@ figs/taxonomy_overview.mmd
 review_v1.md
 ```
 
+`paper_pool_verified.csv` 会保留初筛元数据，包括 `source`、`dedupe_key`、`relevance_score`、`screening_decision`、`screening_reason` 和 `fulltext_status`，对应报告见 `reports/paper_pool_verification_report.md`。
+
 ## 当前状态
 
 当前版本已经完成第一轮系统化建设：
