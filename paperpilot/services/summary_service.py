@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from datetime import timezone
 import html
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,9 +11,15 @@ import re
 from pypdf import PdfReader
 
 from paperpilot.clients.ai import AIClient
-from paperpilot.clients.deepxiv import DeepXivClient
 from paperpilot.clients.zotero import ZoteroClient
+
+try:
+    from paperpilot.clients.deepxiv import DeepXivClient
+except ImportError:
+    DeepXivClient = None  # type: ignore[misc,assignment]
 from paperpilot.models.results import StageResult
+from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryStore
+from paperpilot.storage.summary_parser import extract_structured_fields
 
 
 @dataclass
@@ -86,12 +93,26 @@ def extract_pdf_text(path: Path, max_pages: int) -> str:
     return "\n\n".join(filter(None, texts))
 
 
+try:
+    import markdown
+except ImportError:
+    markdown = None  # type: ignore[misc,assignment]
+
+
 def make_note_html(summary: str) -> str:
+    """Convert markdown summary to HTML suitable for Zotero rich-text notes."""
     timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    safe_text = html.escape(summary or "")
+    title = dt.datetime.now().strftime("AI总结-v2（%Y%m%d-%H%M%S）")
+    if markdown:
+        body = markdown.markdown(
+            summary or "",
+            extensions=["tables", "fenced_code", "nl2br"],
+        )
+    else:
+        body = html.escape(summary or "").replace("\n", "<br>")
     return (
-        f"<p><strong>AI总结</strong>（{timestamp}）</p>"
-        f"<div data-markdown=\"true\" data-mime-type=\"text/markdown\" style=\"white-space:pre-wrap\">{safe_text}</div>"
+        f"<h1>{html.escape(title)}</h1>"
+        f"<div style=\"line-height:1.5; font-size:12px\">{body}</div>"
     )
 
 
@@ -125,11 +146,35 @@ def extract_arxiv_id(data: dict[str, Any]) -> Optional[str]:
 
 
 class SummaryService:
-    def __init__(self, zotero: Optional[ZoteroClient], ai: AIClient, storage_dir: Path, deepxiv: Optional[DeepXivClient] = None) -> None:
+    def __init__(self, zotero: Optional[ZoteroClient], ai: AIClient, storage_dir: Path, deepxiv: Optional[DeepXivClient] = None, summary_store: Optional[PaperSummaryStore] = None) -> None:
         self.zotero = zotero
         self.ai = ai
         self.storage_dir = storage_dir
         self.deepxiv = deepxiv
+        self.summary_store = summary_store
+
+    def _save_to_store(
+        self,
+        summary: str,
+        *,
+        zotero_key: str,
+        title: str,
+        locale: str = "zh",
+        model: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> None:
+        if not self.summary_store or not summary:
+            return
+        fields = extract_structured_fields(
+            summary,
+            zotero_key=zotero_key,
+            title_hint=title,
+            locale=locale,
+            model=model,
+            source=source,
+        )
+        fields["paper_id"] = f"summary_{zotero_key}_{dt.datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        self.summary_store.save(PaperSummary(**fields))
 
     def _build_deepxiv_context(self, arxiv_id: str, sections: tuple[str, ...]) -> str:
         assert self.deepxiv is not None
@@ -185,6 +230,7 @@ class SummaryService:
                 out_file = summary_dir / f"{pdf_path.stem}.summary.md"
                 out_file.write_text(summary, encoding="utf-8")
                 result.artifacts[str(pdf_path)] = str(out_file)
+            self._save_to_store(summary, zotero_key=title, title=title, locale=options.locale, source="pdf")
             result.created += 1
         return result
 
@@ -221,6 +267,7 @@ class SummaryService:
                         )
                         if insert_note and self.zotero:
                             self.zotero.create_note(note_parent_key, make_note_html(summary), tags=[options.note_tag])
+                        self._save_to_store(summary, zotero_key=note_parent_key, title=title, locale=options.locale, source="deepxiv")
                         result.created += 1
                         created_for_item = True
 
@@ -248,6 +295,7 @@ class SummaryService:
                     )
                     if insert_note and self.zotero:
                         self.zotero.create_note(note_parent_key, make_note_html(summary), tags=[options.note_tag])
+                    self._save_to_store(summary, zotero_key=note_parent_key, title=title, locale=options.locale, source="abstract")
                     result.created += 1
                     continue
                 result.skipped += 1
@@ -270,6 +318,7 @@ class SummaryService:
                 )
                 if insert_note and self.zotero:
                     self.zotero.create_note(note_parent_key, make_note_html(summary), tags=[options.note_tag])
+                self._save_to_store(summary, zotero_key=note_parent_key, title=title, locale=options.locale, source="pdf")
                 result.created += 1
                 created_for_item = True
             if not created_for_item:

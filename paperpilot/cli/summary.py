@@ -5,10 +5,14 @@ import sys
 from pathlib import Path
 
 from paperpilot.clients.ai import AIClient
-from paperpilot.clients.deepxiv import DeepXivClient
 from paperpilot.clients.zotero import ZoteroClient
 from paperpilot.services.summary_service import SummaryOptions, SummaryService
 from paperpilot.utils.config import AISettings, load_app_settings
+
+try:
+    from paperpilot.clients.deepxiv import DeepXivClient
+except ImportError:
+    DeepXivClient = None  # type: ignore[misc,assignment]
 
 
 def _cli_args() -> list[str]:

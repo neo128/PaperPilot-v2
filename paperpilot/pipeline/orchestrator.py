@@ -5,7 +5,6 @@ from pathlib import Path
 
 from paperpilot.clients.ai import AIClient
 from paperpilot.clients.arxiv import ArxivClient
-from paperpilot.clients.deepxiv import DeepXivClient
 from paperpilot.clients.notion import NotionClient
 from paperpilot.clients.zotero import ZoteroClient
 from paperpilot.models.results import PipelineResult
@@ -13,8 +12,14 @@ from paperpilot.pipeline.config import PipelineConfig
 from paperpilot.services.notion_sync_service import NotionSyncOptions, NotionSyncService
 from paperpilot.services.summary_service import SummaryOptions, SummaryService
 from paperpilot.services.watch_service import WatchOptions, WatchService
+from paperpilot.storage.paper_summary_store import PaperSummaryStore
 from paperpilot.storage.sqlite_state import SQLiteStateStore
 from paperpilot.utils.config import AISettings, load_app_settings
+
+try:
+    from paperpilot.clients.deepxiv import DeepXivClient
+except ImportError:
+    DeepXivClient = None  # type: ignore[misc,assignment]
 
 
 class PipelineOrchestrator:
@@ -46,7 +51,10 @@ class PipelineOrchestrator:
             deepxiv=self.deepxiv,
             arxiv=self.arxiv,
         )
-        self.summary_service = SummaryService(self.zotero, self.ai, storage_dir, deepxiv=self.deepxiv)
+        summary_db = config.storage_dir / "summaries.sqlite3" if config.storage_dir else Path(".paperpilot/summaries.sqlite3")
+        summary_db.parent.mkdir(parents=True, exist_ok=True)
+        self.summary_store = PaperSummaryStore(summary_db)
+        self.summary_service = SummaryService(self.zotero, self.ai, storage_dir, deepxiv=self.deepxiv, summary_store=self.summary_store)
         self.state_store = SQLiteStateStore(config.state_db_path)
         self.notion_service = None
         if self.settings.notion:
@@ -56,6 +64,8 @@ class PipelineOrchestrator:
     def close(self) -> None:
         if getattr(self, "state_store", None) is not None:
             self.state_store.close()
+        if getattr(self, "summary_store", None) is not None:
+            self.summary_store.close()
 
     def __enter__(self) -> "PipelineOrchestrator":
         return self
