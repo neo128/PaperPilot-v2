@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from deepxiv_sdk import Reader
+try:
+    from deepxiv_sdk import Reader
+except ImportError:
+    Reader = None  # type: ignore[assignment]
 
 
 class DeepXivClient:
@@ -14,6 +17,8 @@ class DeepXivClient:
     """
 
     def __init__(self, token: Optional[str] = None, base_url: Optional[str] = None, timeout: int = 30) -> None:
+        if Reader is None:
+            raise ImportError("deepxiv-sdk is required to use DeepXivClient")
         token = token or os.environ.get("DEEPXIV_TOKEN")
         base_url = base_url or os.environ.get("DEEPXIV_BASE_URL")
         kwargs = {"timeout": timeout}

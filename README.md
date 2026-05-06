@@ -165,6 +165,19 @@ python -m paperpilot.cli.main review run \
   --use-deepxiv
 ```
 
+如果希望运行更完整的综述自动化链路，可以加 `--full`。它会在 `read` 前尝试获取开放获取 PDF 并生成全文复核队列，在 `read` 后执行 curate、matrix、draft 和 qc。默认 curation 只生成预览；确认要覆盖编码表时再加 `--apply-curation`。
+
+```bash
+python -m paperpilot.cli.main review run \
+  --topic "agent memory" \
+  --slug agent-memory \
+  --collection-name "Review - Agent Memory" \
+  --expand-queries \
+  --limit 30 \
+  --full \
+  --unpaywall-email "you@example.com"
+```
+
 默认产物在 `.review_projects/{slug}/`：
 
 ```text

@@ -470,6 +470,34 @@ class LiteratureReviewServiceTest(unittest.TestCase):
             verify = service.verify_fulltext(project, ReviewVerifyOptions(check_zotero=False))
             self.assertEqual(verify.artifacts["status_counts"], {"ready_local_pdf": 1})
 
+    def test_fetch_and_verify_can_run_before_coding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="world-models", topic="taxonomy of world models for embodied AI", root=Path(tmp))
+            service = LiteratureReviewService(open_access=FakeOA())
+            service.build_pool_from_zotero_items(
+                project,
+                [zotero_item("ZOT1", "Robot world model", doi="10.123/test")],
+            )
+
+            fetch = service.fetch_open_access_pdfs(project, ReviewFetchPdfOptions())
+
+            self.assertEqual(fetch.created, 1)
+            self.assertEqual(fetch.artifacts["source_csv"], "data/processed/paper_pool_verified.csv")
+            fetch_csv = project.path / "data/processed/fulltext_fetch_report.csv"
+            with fetch_csv.open(encoding="utf-8", newline="") as f:
+                fetch_rows = list(csv.DictReader(f))
+            self.assertEqual(fetch_rows[0]["tier"], "unranked")
+            self.assertTrue(Path(fetch_rows[0]["local_pdf_path"]).exists())
+
+            verify = service.verify_fulltext(project, ReviewVerifyOptions(check_zotero=False))
+
+            self.assertEqual(verify.artifacts["source_csv"], "data/processed/paper_pool_verified.csv")
+            self.assertEqual(verify.artifacts["status_counts"], {"ready_local_pdf": 1})
+            queue_path = project.path / "data/processed/fulltext_verification_queue.csv"
+            with queue_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[0]["verification_flags"], "pre_coding_fulltext_check")
+
     def test_fetch_open_access_pdfs_can_attach_zotero_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = ReviewProject(slug="world-models", topic="taxonomy of world models for embodied AI", root=Path(tmp))

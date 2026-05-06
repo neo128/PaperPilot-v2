@@ -501,6 +501,35 @@ def _project_pdf_paths(project: ReviewProject, paper_id: str) -> list[Path]:
     return sorted(path for path in pdf_dir.glob(f"{paper_id}_*.pdf") if path.exists())
 
 
+def _fulltext_target_rows(project: ReviewProject) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str, bool]:
+    """Return rows for PDF fetch/verify.
+
+    Once coding exists, tiers come from paper_pool_coded.csv and can be filtered.
+    Before AI reading, fall back to paper_pool_verified.csv so review run can fetch
+    full text first and feed local PDFs into the initial reading pass.
+    """
+    coded_path = project.path / "data/processed/paper_pool_coded.csv"
+    verified_path = project.path / "data/processed/paper_pool_verified.csv"
+    coded_rows = _read_csv(coded_path)
+    verified_rows = _read_csv(verified_path)
+    verified_by_id = {
+        row.get("paper_id"): row
+        for row in verified_rows
+        if row.get("paper_id")
+    }
+    if coded_rows:
+        return coded_rows, verified_by_id, "data/processed/paper_pool_coded.csv", True
+
+    pre_coding_rows: list[dict[str, Any]] = []
+    for row in verified_rows:
+        target = dict(row)
+        target.setdefault("tier", "unranked")
+        target.setdefault("priority_score", "")
+        target["_pre_coding_target"] = True
+        pre_coding_rows.append(target)
+    return pre_coding_rows, verified_by_id, "data/processed/paper_pool_verified.csv", False
+
+
 class LiteratureReviewService:
     def __init__(
         self,
@@ -1000,23 +1029,20 @@ class LiteratureReviewService:
 
     def verify_fulltext(self, project: ReviewProject, options: ReviewVerifyOptions) -> StageResult:
         result = StageResult(stage="review:verify")
-        coded_path = project.path / "data/processed/paper_pool_coded.csv"
-        coded_rows = _read_csv(coded_path)
-        if not coded_rows:
+        target_rows, verified_by_id, source_csv, filter_by_tier = _fulltext_target_rows(project)
+        if not target_rows:
             result.failed += 1
-            result.errors.append(f"Missing or empty coded pool: {coded_path}")
+            result.errors.append(
+                "Missing or empty review pool: expected data/processed/paper_pool_coded.csv "
+                "or data/processed/paper_pool_verified.csv"
+            )
             return result
 
-        verified_by_id = {
-            row.get("paper_id"): row
-            for row in _read_csv(project.path / "data/processed/paper_pool_verified.csv")
-            if row.get("paper_id")
-        }
         include_tiers = {tier.upper() for tier in options.include_tiers}
         queue_rows: list[dict[str, Any]] = []
-        for row in coded_rows:
+        for row in target_rows:
             result.processed += 1
-            if _tier_rank(row.get("tier", "")).upper() not in include_tiers:
+            if filter_by_tier and _tier_rank(row.get("tier", "")).upper() not in include_tiers:
                 result.skipped += 1
                 continue
             pool_row = verified_by_id.get(row.get("paper_id"), {})
@@ -1032,6 +1058,7 @@ class LiteratureReviewService:
             queue_rows=queue_rows,
             status_counts=status_counts,
             include_tiers=tuple(sorted(include_tiers)),
+            source_csv=source_csv,
             storage_dir=options.storage_dir,
             checked_zotero=options.check_zotero and self.zotero is not None,
         )
@@ -1039,24 +1066,22 @@ class LiteratureReviewService:
         result.created = 2
         result.artifacts["verification_queue_csv"] = str(queue_path)
         result.artifacts["verification_report"] = str(report_path)
+        result.artifacts["source_csv"] = source_csv
         result.artifacts["target_papers"] = len(queue_rows)
         result.artifacts["status_counts"] = dict(status_counts)
         return result
 
     def fetch_open_access_pdfs(self, project: ReviewProject, options: ReviewFetchPdfOptions) -> StageResult:
         result = StageResult(stage="review:fetch-pdfs")
-        coded_path = project.path / "data/processed/paper_pool_coded.csv"
-        coded_rows = _read_csv(coded_path)
-        if not coded_rows:
+        target_rows, verified_by_id, source_csv, filter_by_tier = _fulltext_target_rows(project)
+        if not target_rows:
             result.failed += 1
-            result.errors.append(f"Missing or empty coded pool: {coded_path}")
+            result.errors.append(
+                "Missing or empty review pool: expected data/processed/paper_pool_coded.csv "
+                "or data/processed/paper_pool_verified.csv"
+            )
             return result
 
-        verified_by_id = {
-            row.get("paper_id"): row
-            for row in _read_csv(project.path / "data/processed/paper_pool_verified.csv")
-            if row.get("paper_id")
-        }
         include_tiers = {tier.upper() for tier in options.include_tiers}
         output_dir = options.output_dir or (project.path / "data/interim/pdfs")
         fetch_rows: list[dict[str, Any]] = []
@@ -1068,9 +1093,9 @@ class LiteratureReviewService:
 
             oa_client = OpenAccessClient(email=options.email)
 
-        for row in coded_rows:
+        for row in target_rows:
             result.processed += 1
-            if _tier_rank(row.get("tier", "")).upper() not in include_tiers:
+            if filter_by_tier and _tier_rank(row.get("tier", "")).upper() not in include_tiers:
                 result.skipped += 1
                 continue
             if options.limit and targets_seen >= options.limit:
@@ -1097,12 +1122,14 @@ class LiteratureReviewService:
             fetch_rows=fetch_rows,
             status_counts=status_counts,
             include_tiers=tuple(sorted(include_tiers)),
+            source_csv=source_csv,
             output_dir=output_dir,
             dry_run=options.dry_run,
             attach_zotero=options.attach_zotero,
         )
         result.artifacts["fetch_report_csv"] = str(csv_path)
         result.artifacts["fetch_report"] = str(report_path)
+        result.artifacts["source_csv"] = source_csv
         result.artifacts["status_counts"] = dict(status_counts)
         result.artifacts["output_dir"] = str(output_dir)
         return result
@@ -1506,6 +1533,8 @@ class LiteratureReviewService:
         return "Application / Contextual Supporting Papers"
 
     def _verification_flags(self, project: ReviewProject, row: dict[str, Any]) -> list[str]:
+        if row.get("_pre_coding_target"):
+            return ["pre_coding_fulltext_check"]
         flags: list[str] = []
         if any(_has_verification_marker(row.get(field, "")) for field in CODED_POOL_FIELDS):
             flags.append("coded_fields_need_verification")
@@ -1687,6 +1716,7 @@ class LiteratureReviewService:
         queue_rows: list[dict[str, Any]],
         status_counts: Counter[str],
         include_tiers: tuple[str, ...],
+        source_csv: str,
         storage_dir: Optional[Path],
         checked_zotero: bool,
     ) -> None:
@@ -1695,7 +1725,7 @@ class LiteratureReviewService:
             "",
             f"- topic: {project.topic}",
             f"- updated_at: {_utc_now()}",
-            f"- source: `data/processed/paper_pool_coded.csv`",
+            f"- source: `{source_csv}`",
             f"- output: `data/processed/fulltext_verification_queue.csv`",
             f"- included_tiers: {', '.join(include_tiers)}",
             f"- target_papers: {len(queue_rows)}",
@@ -1826,6 +1856,7 @@ class LiteratureReviewService:
         fetch_rows: list[dict[str, Any]],
         status_counts: Counter[str],
         include_tiers: tuple[str, ...],
+        source_csv: str,
         output_dir: Path,
         dry_run: bool,
         attach_zotero: bool,
@@ -1835,7 +1866,7 @@ class LiteratureReviewService:
             "",
             f"- topic: {project.topic}",
             f"- updated_at: {_utc_now()}",
-            f"- source: `data/processed/paper_pool_coded.csv`",
+            f"- source: `{source_csv}`",
             f"- output_csv: `data/processed/fulltext_fetch_report.csv`",
             f"- output_dir: `{output_dir}`",
             f"- included_tiers: {', '.join(include_tiers)}",

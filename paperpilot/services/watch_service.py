@@ -8,10 +8,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from paperpilot.clients.arxiv import ArxivClient
-from paperpilot.clients.deepxiv import DeepXivClient
 from paperpilot.clients.journals import search_journals
 from paperpilot.clients.zotero import ZoteroClient
 from paperpilot.models.results import StageResult
+
+try:
+    from paperpilot.clients.deepxiv import DeepXivClient
+except ImportError:
+    DeepXivClient = None  # type: ignore[misc,assignment]
 
 logger = logging.getLogger(__name__)
 

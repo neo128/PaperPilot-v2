@@ -106,6 +106,44 @@ class ReviewCliTest(unittest.TestCase):
         self.assertEqual(_keyword_args(args.include_keyword), ("robotics", "world model"))
         self.assertEqual(_keyword_args(args.exclude_keyword), ("clinical",))
 
+    def test_run_parser_accepts_full_chain_options(self):
+        args = build_parser().parse_args([
+            "run",
+            "--topic",
+            "agent memory",
+            "--slug",
+            "agent-memory",
+            "--full",
+            "--apply-curation",
+            "--fulltext-tier",
+            "A",
+            "--matrix-tier",
+            "B",
+            "--unpaywall-email",
+            "user@example.com",
+            "--fetch-output-dir",
+            "/tmp/pdfs",
+            "--attach-zotero-pdfs",
+            "--fetch-dry-run",
+            "--verify-skip-zotero",
+            "--storage-dir",
+            "/tmp/zotero",
+            "--qc-draft-path",
+            "review_v1.md",
+        ])
+        self.assertEqual(args.command, "run")
+        self.assertTrue(args.full)
+        self.assertTrue(args.apply_curation)
+        self.assertEqual(args.fulltext_tier, ["A"])
+        self.assertEqual(args.matrix_tier, ["B"])
+        self.assertEqual(args.unpaywall_email, "user@example.com")
+        self.assertEqual(args.fetch_output_dir, "/tmp/pdfs")
+        self.assertTrue(args.attach_zotero_pdfs)
+        self.assertTrue(args.fetch_dry_run)
+        self.assertTrue(args.verify_skip_zotero)
+        self.assertEqual(args.storage_dir, "/tmp/zotero")
+        self.assertEqual(args.qc_draft_path, "review_v1.md")
+
     @patch("paperpilot.cli.review.ZoteroClient")
     @patch("paperpilot.cli.review.load_app_settings")
     def test_need_ai_requires_api_key(self, load_settings, zotero_client):
@@ -182,6 +220,74 @@ class ReviewCliTest(unittest.TestCase):
 
         deepxiv_client.assert_not_called()
         self.assertIsNone(watch_service.call_args.kwargs["deepxiv"])
+
+    @patch("paperpilot.cli.review.DeepXivClient")
+    @patch("paperpilot.cli.review.WatchService")
+    @patch("paperpilot.cli.review.LiteratureReviewService")
+    @patch("paperpilot.cli.review.AIClient")
+    @patch("paperpilot.cli.review.ZoteroClient")
+    @patch("paperpilot.cli.review.load_app_settings")
+    def test_run_full_invokes_complete_stage_chain(
+        self,
+        load_settings,
+        zotero_client,
+        ai_client,
+        review_service,
+        watch_service,
+        deepxiv_client,
+    ):
+        load_settings.return_value = AppSettings(
+            zotero=ZoteroSettings(user_id="123", api_key="zkey"),
+            notion=None,
+            ai=AISettings(provider="openai", api_key="akey", model="gpt-test"),
+        )
+        zotero_client.return_value.fetch_item.return_value = {"key": "ZOT1", "data": {"key": "ZOT1", "title": "Paper"}}
+
+        service = review_service.return_value
+        service.init_project.return_value = StageResult(stage="review:init")
+        service.build_pool_from_zotero_items.return_value = StageResult(stage="review:build-pool")
+        service.fetch_open_access_pdfs.return_value = StageResult(stage="review:fetch-pdfs")
+        service.verify_fulltext.return_value = StageResult(stage="review:verify")
+        service.read_and_code.return_value = StageResult(stage="review:read")
+        service.curate_coded_pool.return_value = StageResult(stage="review:curate")
+        service.build_matrices.return_value = StageResult(stage="review:matrix")
+        service.draft_review.return_value = StageResult(stage="review:draft")
+        service.qc_review.return_value = StageResult(stage="review:qc")
+        watch_service.return_value.search_and_import.return_value = StageResult(
+            stage="watch",
+            artifacts={"managed_keys": ["ZOT1"]},
+        )
+
+        with patch("sys.stdout", io.StringIO()), patch(
+            "sys.argv",
+            [
+                "prog",
+                "review",
+                "run",
+                "--topic",
+                "agent memory",
+                "--slug",
+                "agent-memory",
+                "--full",
+                "--fetch-dry-run",
+            ],
+        ):
+            review_cli.main()
+
+        self.assertEqual(
+            [call[0] for call in service.method_calls],
+            [
+                "init_project",
+                "build_pool_from_zotero_items",
+                "fetch_open_access_pdfs",
+                "verify_fulltext",
+                "read_and_code",
+                "curate_coded_pool",
+                "build_matrices",
+                "draft_review",
+                "qc_review",
+            ],
+        )
 
 
 if __name__ == "__main__":
