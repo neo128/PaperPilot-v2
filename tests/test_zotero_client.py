@@ -140,6 +140,29 @@ class ZoteroClientHelpersTest(unittest.TestCase):
         self.assertEqual(put_call[2]["json"]["note"], "<h1>new</h1>")
         self.assertEqual(put_call[2]["headers"], {"If-Unmodified-Since-Version": "12"})
 
+    def test_delete_item_uses_version_header(self):
+        calls = []
+        client = ZoteroClient("123", "key", use_env_proxy=False)
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+
+            class Resp:
+                def json(self):
+                    return {}
+
+                def raise_for_status(self):
+                    return None
+
+            return Resp()
+
+        client._request = fake_request
+        client.delete_item("NOTE1", 9)
+
+        self.assertEqual(calls[0][0], "delete")
+        self.assertIn("/items/NOTE1", calls[0][1])
+        self.assertEqual(calls[0][2]["headers"], {"If-Unmodified-Since-Version": "9"})
+
 
 if __name__ == "__main__":
     unittest.main()

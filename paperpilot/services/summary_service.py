@@ -224,9 +224,9 @@ class SummaryService:
         source_priority: Optional[int] = None,
         stale_reason: Optional[str] = None,
         figures: Optional[list[ExtractedFigure]] = None,
-    ) -> None:
+    ) -> Optional[str]:
         if not self.summary_store or not summary:
-            return
+            return None
         fields = extract_structured_fields(
             summary,
             zotero_key=zotero_key,
@@ -270,6 +270,7 @@ class SummaryService:
             for index, figure in enumerate(figures or [], start=1)
         ]
         self.summary_store.save(PaperSummary(**fields), facts=facts, figures=figure_rows)
+        return str(fields["paper_id"])
 
     def _cached_canonical(self, *, zotero_key: str, canonical_key: str, pdf_hash: Optional[str], options: SummaryOptions) -> Optional[PaperSummary]:
         if not self.summary_store or options.force:
@@ -281,26 +282,27 @@ class SummaryService:
             pdf_hash=pdf_hash,
         )
 
-    def _write_summary_attachment(self, parent_key: str, summary_md: str, *, title: str, mode: str = "general") -> bool:
+    def _write_summary_attachment(self, parent_key: str, summary_md: str, *, title: str, mode: str = "general") -> tuple[bool, Optional[str], Optional[str]]:
         if not self.zotero or not parent_key or not summary_md:
-            return False
+            return False, None, None
         create_file_attachment = getattr(self.zotero, "create_file_attachment", None)
         if not callable(create_file_attachment):
             self.zotero.create_note(parent_key, make_note_html(summary_md), tags=[versioned_ai_summary_label("AI总结")])
-            return True
+            return True, None, versioned_ai_summary_label("AI总结")
         attachment_dir = Path(".paperpilot-zotero-attachments") / "canonical"
         attachment_dir.mkdir(parents=True, exist_ok=True)
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", title or parent_key).strip("_") or parent_key
         md_path = attachment_dir / f"{stem}_{AI_SUMMARY_VERSION}.md"
         md_path.write_text(summary_md, encoding="utf-8")
-        create_file_attachment(
+        attachment_title = f"PaperPilot {versioned_ai_summary_label('AI总结')} Markdown - {title or parent_key}"
+        attachment_key = create_file_attachment(
             parent_key,
             md_path,
-            title=f"PaperPilot {versioned_ai_summary_label('AI总结')} Markdown - {title or parent_key}",
+            title=attachment_title,
             content_type="text/markdown",
             tags=["AI总结附件", f"{versioned_ai_summary_label('AI总结')}-md", f"summary-mode:{mode}"],
         )
-        return True
+        return True, attachment_key, attachment_title
 
     def _figure_asset_root(self) -> Path:
         if self.summary_store is not None:
@@ -406,7 +408,7 @@ class SummaryService:
             else []
         )
         summary = self._inject_figures_section(summary, figures)
-        self._save_to_store(
+        paper_id = self._save_to_store(
             summary,
             zotero_key=zotero_key,
             title=title,
@@ -420,7 +422,14 @@ class SummaryService:
             figures=figures,
         )
         if insert_attachment and options.attach_zotero:
-            self._write_summary_attachment(zotero_key, summary, title=title, mode=options.mode)
+            ok, attachment_key, attachment_title = self._write_summary_attachment(zotero_key, summary, title=title, mode=options.mode)
+            if paper_id and self.summary_store:
+                self.summary_store.update_attachment_status(
+                    paper_id,
+                    attachment_key=attachment_key,
+                    attachment_title=attachment_title,
+                    status="uploaded" if ok else "failed",
+                )
         return summary
 
     def _build_deepxiv_context(self, arxiv_id: str, sections: tuple[str, ...]) -> str:
@@ -549,7 +558,7 @@ class SummaryService:
                             max_chars=options.max_chars,
                             mode=options.mode,
                         )
-                        self._save_to_store(
+                        paper_id = self._save_to_store(
                             summary,
                             zotero_key=note_parent_key,
                             title=title,
@@ -561,7 +570,14 @@ class SummaryService:
                             source_priority=20,
                         )
                         if insert_note and options.attach_zotero:
-                            self._write_summary_attachment(note_parent_key, summary, title=title, mode=options.mode)
+                            ok, attachment_key, attachment_title = self._write_summary_attachment(note_parent_key, summary, title=title, mode=options.mode)
+                            if paper_id and self.summary_store:
+                                self.summary_store.update_attachment_status(
+                                    paper_id,
+                                    attachment_key=attachment_key,
+                                    attachment_title=attachment_title,
+                                    status="uploaded" if ok else "failed",
+                                )
                         result.created += 1
                         created_for_item = True
 
@@ -590,7 +606,7 @@ class SummaryService:
                         max_chars=min(options.max_chars, 4000),
                         mode=options.mode,
                     )
-                    self._save_to_store(
+                    paper_id = self._save_to_store(
                         summary,
                         zotero_key=note_parent_key,
                         title=title,
@@ -602,7 +618,14 @@ class SummaryService:
                         source_priority=10,
                     )
                     if insert_note and options.attach_zotero:
-                        self._write_summary_attachment(note_parent_key, summary, title=title, mode=options.mode)
+                        ok, attachment_key, attachment_title = self._write_summary_attachment(note_parent_key, summary, title=title, mode=options.mode)
+                        if paper_id and self.summary_store:
+                            self.summary_store.update_attachment_status(
+                                paper_id,
+                                attachment_key=attachment_key,
+                                attachment_title=attachment_title,
+                                status="uploaded" if ok else "failed",
+                            )
                     result.created += 1
                     continue
                 result.skipped += 1

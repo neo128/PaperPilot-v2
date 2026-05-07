@@ -356,6 +356,13 @@ class ZoteroClient:
             headers={"If-Unmodified-Since-Version": str(version)},
         )
 
+    def delete_item(self, item_key: str, version: int) -> None:
+        self._request(
+            "delete",
+            f"{self.base}/items/{item_key}",
+            headers={"If-Unmodified-Since-Version": str(version)},
+        )
+
     def add_item_to_collection(self, item_key: str, collection_key: str) -> bool:
         entry = self.fetch_item(item_key)
         data = dict(_entry_data(entry))

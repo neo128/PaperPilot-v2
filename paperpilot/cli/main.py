@@ -10,6 +10,7 @@ from paperpilot.cli.pipeline import main as pipeline_main
 from paperpilot.cli.review import main as review_main
 from paperpilot.cli.summary import main as summary_main
 from paperpilot.cli.watch import main as watch_main
+from paperpilot.cli.zotero import main as zotero_main
 from paperpilot.pipeline import NotionStageConfig, PipelineConfig, PipelineOrchestrator, SummaryStageConfig, WatchStageConfig
 from paperpilot.utils.run_logging import (
     log_command_finish,
@@ -28,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("notion-sync", add_help=False)
     sub.add_parser("pipeline", add_help=False)
     sub.add_parser("review", add_help=False)
+    sub.add_parser("zotero", add_help=False)
 
     run = sub.add_parser("run", help="Run unified pipeline")
     run.add_argument("--watch-query")
@@ -69,6 +71,10 @@ def main() -> None:
             return
         if args.command == "review":
             review_main()
+            log_command_finish(success=True)
+            return
+        if args.command == "zotero":
+            zotero_main()
             log_command_finish(success=True)
             return
         if args.command == "run":

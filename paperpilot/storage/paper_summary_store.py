@@ -53,6 +53,10 @@ class PaperSummary:
     summary_profile: Optional[str] = None
     source_priority: Optional[int] = None
     stale_reason: Optional[str] = None
+    zotero_attachment_key: Optional[str] = None
+    zotero_attachment_title: Optional[str] = None
+    attached_at: Optional[str] = None
+    attachment_status: Optional[str] = None
 
 
 @dataclass
@@ -157,7 +161,11 @@ class PaperSummaryStore:
                 canonical_key TEXT,
                 summary_profile TEXT,
                 source_priority INTEGER,
-                stale_reason TEXT
+                stale_reason TEXT,
+                zotero_attachment_key TEXT,
+                zotero_attachment_title TEXT,
+                attached_at TEXT,
+                attachment_status TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_summary_facts (
                 fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,6 +217,10 @@ class PaperSummaryStore:
             "summary_profile",
             "source_priority",
             "stale_reason",
+            "zotero_attachment_key",
+            "zotero_attachment_title",
+            "attached_at",
+            "attachment_status",
         ]:
             try:
                 self.conn.execute(f"ALTER TABLE paper_summaries ADD COLUMN {col} TEXT DEFAULT ''")
@@ -259,8 +271,9 @@ class PaperSummaryStore:
                 generalization_deployment, research_opportunities,
                 evidence, full_summary_md, locale, model, created_at, source,
                 summary_version, summary_kind, review_slug, pdf_hash, canonical_key,
-                summary_profile, source_priority, stale_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                summary_profile, source_priority, stale_reason, zotero_attachment_key,
+                zotero_attachment_title, attached_at, attachment_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary.paper_id,
@@ -302,6 +315,10 @@ class PaperSummaryStore:
                 summary.summary_profile,
                 summary.source_priority,
                 summary.stale_reason,
+                summary.zotero_attachment_key,
+                summary.zotero_attachment_title,
+                summary.attached_at,
+                summary.attachment_status,
             ),
         )
         for fact in facts or []:
@@ -359,6 +376,28 @@ class PaperSummaryStore:
                 figure.created_at or utc_now(),
             ),
         )
+
+    def update_attachment_status(
+        self,
+        paper_id: str,
+        *,
+        attachment_key: Optional[str] = None,
+        attachment_title: Optional[str] = None,
+        status: str = "",
+        attached_at: Optional[str] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE paper_summaries
+            SET zotero_attachment_key = ?,
+                zotero_attachment_title = ?,
+                attached_at = ?,
+                attachment_status = ?
+            WHERE paper_id = ?
+            """,
+            (attachment_key, attachment_title, attached_at or utc_now(), status, paper_id),
+        )
+        self.conn.commit()
 
     def get_by_zotero_key(self, zotero_key: str) -> Optional[PaperSummary]:
         row = self.conn.execute(
@@ -525,6 +564,10 @@ class PaperSummaryStore:
             summary_profile=row["summary_profile"],
             source_priority=row["source_priority"],
             stale_reason=row["stale_reason"],
+            zotero_attachment_key=row["zotero_attachment_key"],
+            zotero_attachment_title=row["zotero_attachment_title"],
+            attached_at=row["attached_at"],
+            attachment_status=row["attachment_status"],
         )
 
     @staticmethod

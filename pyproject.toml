@@ -19,3 +19,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["paperpilot*"]
+
+[tool.setuptools.package-data]
+paperpilot = ["prompts/*.md"]

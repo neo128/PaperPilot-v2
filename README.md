@@ -68,6 +68,61 @@ python -m paperpilot.cli.notion_sync --dry-run
 python -m paperpilot.cli.pipeline --summary-use-deepxiv --notion-dry-run
 ```
 
+## AI Summary 分层与 Zotero 附件
+
+`summary` 支持本地 PDF 生成 canonical AI summary。默认写入 SQLite；使用 `--summary-dir` 时也会输出 Markdown 文件。
+
+```bash
+python -m paperpilot.cli.main summary \
+  --pdf-path /path/to/paper.pdf \
+  --summary-dir .paperpilot/test-summaries \
+  --summary-db-path .paperpilot/summaries.sqlite3 \
+  --max-pages 0 \
+  --max-chars 200000 \
+  --mode general \
+  --force-summary \
+  --no-zotero-attachment
+```
+
+如果已有本地 Markdown summary，并且有 `paper_id,zotero_key,title` 映射 CSV，可以批量挂到对应 Zotero 条目下。默认可先 dry-run：
+
+```bash
+python -m paperpilot.cli.main summary attach \
+  --summary-dir .paperpilot/test-summaries/full-real-5 \
+  --mapping-csv .review_projects/active-exploration-world-models/bib/citation_keys.csv \
+  --dry-run
+```
+
+确认后去掉 `--dry-run` 即可上传 Markdown 附件。上传前会检查同名、同标题或 `AI总结-v2-md` 标签，避免重复挂载。
+
+## Zotero 维护
+
+清理旧的 Zotero rich-text AI note 时，使用 `zotero cleanup-ai-notes`。该命令默认 dry-run，并会先备份匹配 note HTML；只有加 `--apply` 才会删除。
+
+```bash
+python -m paperpilot.cli.main zotero cleanup-ai-notes \
+  --after 2026-04-01
+
+python -m paperpilot.cli.main zotero cleanup-ai-notes \
+  --after 2026-04-01 \
+  --apply
+```
+
+## 运行日志
+
+通过 `paperpilot.cli.main` 运行的命令会写入：
+
+- `.paperpilot/logs/*.log`
+- `.paperpilot/logs/*.jsonl`
+
+可通过环境变量调整：
+
+```bash
+PAPERPILOT_LOG_LEVEL=DEBUG
+PAPERPILOT_LOG_CONSOLE_LEVEL=WARNING
+PAPERPILOT_LOG_DIR=.paperpilot/logs
+```
+
 ## 文献综述 Phase 1：检索并纳入 Zotero
 
 `watch` 可作为系统性综述的第一步：根据主题或提示词检索论文，先在 Zotero 中按 DOI / arXiv ID / 标题查重；命中已有条目则直接复用，未命中才新增。

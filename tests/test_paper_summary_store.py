@@ -124,6 +124,30 @@ def test_store_saves_extracted_figures():
         store.close()
 
 
+def test_store_updates_zotero_attachment_status():
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "test.sqlite3"
+        store = PaperSummaryStore(db)
+
+        fields = extract_structured_fields(SAMPLE_MD, zotero_key="ABC123", title_hint="Test Paper")
+        fields["paper_id"] = "test_attachment"
+        store.save(PaperSummary(**fields))
+
+        store.update_attachment_status(
+            "test_attachment",
+            attachment_key="ATTACH1",
+            attachment_title="PaperPilot AI总结-v2 Markdown - Test Paper",
+            status="uploaded",
+            attached_at="2026-05-07T00:00:00+00:00",
+        )
+        summary = store.get_by_zotero_key("ABC123")
+
+        assert summary is not None
+        assert summary.zotero_attachment_key == "ATTACH1"
+        assert summary.attachment_status == "uploaded"
+        store.close()
+
+
 def test_store_has_summary():
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "test.sqlite3"

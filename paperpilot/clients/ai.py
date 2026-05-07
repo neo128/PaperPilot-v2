@@ -4,6 +4,7 @@ import os
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -98,7 +99,8 @@ class AIClient:
             system_msg = (
                 "你是一名严谨的科研论文结构化分析助手，擅长从论文全文或摘要中提取可复用的事实、方法、证据与局限。"
             )
-            prompt = (
+            template = _load_prompt_template("summary_general_zh.md")
+            prompt = _render_prompt_template(template, title=title, excerpt=excerpt) if template else (
                 "你的任务是生成**canonical AI summary（论文级通用总结）**："
                 "只做论文事实层、方法层、证据层和可复用信息整理，不要默认围绕某个综述主题改写论文价值。\n\n"
                 "## 全局要求\n"
@@ -307,3 +309,14 @@ class AIClient:
             temperature=0.15,
             top_p=0.9,
         ).strip()
+
+
+def _load_prompt_template(name: str) -> str:
+    path = Path(__file__).resolve().parents[1] / "prompts" / name
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def _render_prompt_template(template: str, *, title: str, excerpt: str) -> str:
+    return template.replace("{{title}}", title).replace("{{excerpt}}", excerpt)
