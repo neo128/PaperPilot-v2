@@ -63,8 +63,25 @@ class AIClient:
         locale: str = "zh",
         max_chars: int = 4000,
         model: Optional[str] = None,
+        mode: str = "general",
     ) -> str:
         excerpt = self.truncate_text(text or "", max_chars)
+        if mode == "brief":
+            system_msg = "You are a precise research-paper screening assistant."
+            prompt = (
+                f"Summarize this paper briefly in Markdown, strictly based on the supplied text. "
+                "Return: one-line summary, key method, evidence-backed result if present, limitations, and whether it deserves full reading.\n\n"
+                f"Title: {title}\n\nText:\n{excerpt}"
+            )
+            return self.chat(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ],
+                model=model,
+                temperature=0.1,
+                top_p=0.9,
+            ).strip()
         if (locale or "").lower() == "en":
             out_limit = max(800, min(2000, max_chars // 2))
             system_msg = "You are an AI research assistant specialized in AI/AGI/robotics paper analysis."
@@ -165,7 +182,14 @@ class AIClient:
             system_msg = "You are a rigorous academic literature-review assistant."
             prompt = (
                 f"Deep-read this paper for a literature review on: {topic}.\n"
-                "Use Markdown. Do not invent missing facts; mark uncertain fields as needs_verification.\n\n"
+                "Use Markdown. Treat the supplied context as a bounded evidence packet, not as license to infer missing sections. "
+                "Do not invent missing facts; mark only truly missing or unsupported fields as needs_verification.\n\n"
+                "Evidence rules:\n"
+                "- Every concrete claim about datasets, baselines, metrics, results, code, robots, or deployment must cite a short source phrase in parentheses.\n"
+                "- Separate author-stated facts from your review-topic interpretation.\n"
+                "- If a paper is only indirectly related to the review topic, say so explicitly and do not force-fit it as a world-model or active-exploration paper.\n"
+                "- Do not claim that the PDF/text is truncated unless the context explicitly says extraction failed or a required section is absent.\n"
+                "- Use needs_verification only for specific missing facts, not as a generic disclaimer.\n\n"
                 "Include: problem, method, experiments, main findings, limitations, relation to the review questions, "
                 "engineering reusability, and evidence snippets.\n\n"
                 f"Title: {title}\nMetadata: {metadata}\n\nContext:\n{excerpt}"
@@ -174,7 +198,14 @@ class AIClient:
             system_msg = "你是一名严谨的系统性文献综述助手。"
             prompt = (
                 f'请围绕综述主题"{topic}"精读这篇论文，并输出 Markdown。'
-                "不得编造缺失事实；不确定处标注 needs_verification。\n\n"
+                "请把输入上下文视为有边界的证据包，不得把未提供的信息补写成事实；只有具体字段缺失或证据不足时才标注 needs_verification。\n\n"
+                "## 证据约束\n"
+                "- 关于数据集、baseline、指标、数值结果、代码、机器人平台、真实部署、消融实验的每个具体判断，都必须在句末括号中给出短证据短语。\n"
+                "- 明确区分【作者原文事实】和【综述主题解释】；解释性内容必须标注为“综述解读”。\n"
+                "- 如果论文与综述主题只是间接相关，必须写“间接相关/弱相关”，不要强行称其为主动探索或世界模型论文。\n"
+                "- 只有上下文明确显示抽取失败、相关章节缺失、或证据包不含该信息时，才说“需全文复核”；不要泛泛写“PDF截断”。\n"
+                "- needs_verification 必须绑定到具体缺失项，例如“代码开源状态 needs_verification”，不要作为整段免责声明。\n"
+                "- 对非具身智能论文，先说明领域不匹配，再给跨域启发；不得把跨域启发写成作者贡献。\n\n"
                 "请包含：研究问题、方法、实验、主要发现、局限、与综述问题的关系、工程复用性、证据摘录。\n\n"
                 f"论文标题：{title}\n元数据：{metadata}\n\n上下文：\n{excerpt}"
             )
@@ -211,7 +242,12 @@ class AIClient:
             "priority_score, tier, research_direction, task_type, method_type, model_or_system_type, data_type, "
             "benchmark_or_environment, real_world_or_simulation, open_source_status, core_contribution, main_limitation, "
             "evidence_strength, engineering_reusability, relation_to_target_topic, coding_confidence, coding_note. "
-            "Use tier values: A 核心池, B 主体池, C 备选池, D 存档池. Mark uncertain fields as needs_verification."
+            "Use tier values: A 核心池, B 主体池, C 备选池, D 存档池. "
+            "priority_score must be an integer from 0 to 100. "
+            "coding_confidence must be one of high, medium, low, needs_verification. "
+            "A paper should be A only if it directly studies active exploration with world models in embodied AI; "
+            "use B for foundational world-model infrastructure, C for indirect baselines/surveys, and D for off-topic papers. "
+            "Do not upgrade an indirect paper by speculative relation. Mark uncertain fields as needs_verification."
         )
         text = self.chat(
             [

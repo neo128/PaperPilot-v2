@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import mimetypes
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -266,6 +269,85 @@ class ZoteroClient:
                 keys.append(info["key"])
         return keys
 
+    def create_file_attachment(
+        self,
+        parent_key: str,
+        file_path: str | Path,
+        *,
+        title: Optional[str] = None,
+        content_type: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        path = Path(file_path)
+        data = path.read_bytes()
+        filename = path.name
+        mime = content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        attachment_keys = self.create_items([
+            {
+                "itemType": "attachment",
+                "parentItem": parent_key,
+                "linkMode": "imported_file",
+                "title": title or filename,
+                "note": "",
+                "tags": [{"tag": t} for t in (tags or [])],
+                "relations": {},
+                "contentType": mime,
+                "charset": "utf-8" if mime.startswith("text/") else "",
+                "filename": filename,
+                "md5": None,
+                "mtime": None,
+            }
+        ])
+        if not attachment_keys:
+            return None
+        attachment_key = attachment_keys[0]
+        md5 = hashlib.md5(data).hexdigest()
+        mtime_ms = int(path.stat().st_mtime * 1000)
+        auth = self._request(
+            "post",
+            f"{self.base}/items/{attachment_key}/file",
+            data={
+                "md5": md5,
+                "filename": filename,
+                "filesize": str(len(data)),
+                "mtime": str(mtime_ms),
+            },
+            headers={"If-None-Match": "*"},
+        ).json()
+        if auth.get("exists"):
+            return attachment_key
+
+        upload_body = auth.get("prefix", "").encode("utf-8") + data + auth.get("suffix", "").encode("utf-8")
+        upload_response = self._upload_file_with_retry(
+            auth["url"],
+            upload_body,
+            content_type=auth["contentType"],
+        )
+        upload_response.raise_for_status()
+        self._request(
+            "post",
+            f"{self.base}/items/{attachment_key}/file",
+            data={"upload": auth["uploadKey"]},
+            headers={"If-None-Match": "*"},
+        )
+        return attachment_key
+
+    def _upload_file_with_retry(self, url: str, body: bytes, *, content_type: str) -> requests.Response:
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return requests.post(
+                    url,
+                    data=body,
+                    headers={"Content-Type": content_type},
+                    timeout=max(self.timeout, 60),
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                time.sleep(1.5 * (attempt + 1))
+        assert last_exc is not None
+        raise last_exc
+
     def update_item(self, item_key: str, version: int, new_data: Dict[str, Any]) -> None:
         self._request(
             "put",
@@ -291,6 +373,14 @@ class ZoteroClient:
     def create_note(self, parent_key: str, note_html: str, tags: Optional[List[str]] = None) -> None:
         payload = [{"itemType": "note", "parentItem": parent_key, "note": note_html, "tags": [{"tag": t} for t in (tags or [])]}]
         self._request("post", f"{self.base}/items", json=payload)
+
+    def update_note(self, note_key: str, version: int, note_html: str, tags: Optional[List[str]] = None) -> None:
+        entry = self.fetch_item(note_key)
+        data = dict(_entry_data(entry))
+        data["note"] = note_html
+        data["tags"] = [{"tag": t} for t in (tags or [])]
+        item_version = int(entry.get("version") or data.get("version") or version)
+        self.update_item(note_key, item_version, data)
 
     def create_attachment_url(
         self,

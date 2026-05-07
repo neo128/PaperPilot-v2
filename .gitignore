@@ -1,6 +1,7 @@
 .env
 .venv/
 .paperpilot/
+.paperpilot-zotero-attachments/
 .review_projects/
 __pycache__/
 *.py[cod]

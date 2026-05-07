@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from paperpilot.models.results import StageResult
-from paperpilot.services.summary_service import extract_pdf_text
+from paperpilot.services.markdown_render import render_markdown_html
+from paperpilot.services.summary_service import SummaryOptions, SummaryService, canonical_key_from_metadata, extract_pdf_text, file_sha256
+from paperpilot.services.summary_version import AI_SUMMARY_VERSION, versioned_ai_summary_label
+from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryFact, PaperSummaryStore
+from paperpilot.storage.summary_parser import extract_structured_fields, extract_summary_facts
 
 
 PAPER_POOL_FIELDS = [
@@ -256,6 +260,10 @@ class ReviewReadOptions:
     use_local_pdfs: bool = True
     pdf_max_pages: int = 12
     paper_ids: tuple[str, ...] = ()
+    refresh_verified_fulltext: bool = True
+    summary_mode: str = "canonical"
+    force_summary: bool = False
+    force_read_pdf: bool = False
 
 
 @dataclass
@@ -760,11 +768,13 @@ class LiteratureReviewService:
         zotero: Optional[Any] = None,
         deepxiv: Optional[Any] = None,
         open_access: Optional[Any] = None,
+        summary_store: Optional[PaperSummaryStore] = None,
     ) -> None:
         self.ai = ai
         self.zotero = zotero
         self.deepxiv = deepxiv
         self.open_access = open_access
+        self.summary_store = summary_store
 
     def init_project(self, project: ReviewProject) -> StageResult:
         result = StageResult(stage="review:init")
@@ -894,6 +904,8 @@ class LiteratureReviewService:
         rows = _read_csv(pool_path)
         coded_rows: list[dict[str, Any]] = []
         existing_coded = {row.get("paper_id"): row for row in _read_csv(project.path / "data/processed/paper_pool_coded.csv")}
+        verified_fulltext = self._verified_fulltext_statuses(project)
+        zotero_asset_cache: dict[str, dict[str, Any]] = {}
 
         selected_rows = rows
         if options.paper_ids:
@@ -905,20 +917,37 @@ class LiteratureReviewService:
             result.processed += 1
             paper_id = row.get("paper_id") or f"P{result.processed:03d}"
             card_path = project.path / "notes/core" / f"{paper_id}_{_safe_filename(row.get('title', 'paper'))}.md"
-            if card_path.exists() and not options.force:
+            refresh_for_fulltext = (
+                options.refresh_verified_fulltext
+                and verified_fulltext.get(paper_id) == "ready_local_pdf"
+                and self._reading_card_flags(project, {"reading_card": str(card_path.relative_to(project.path))}, include_markers=True)
+            )
+            if card_path.exists() and not options.force and not refresh_for_fulltext:
                 coded_rows.append(existing_coded.get(paper_id, self._default_coded_row(row, card_path, "skipped_existing")))
                 result.skipped += 1
                 continue
+            existing_note = self._existing_zotero_review_note(row, project.slug, zotero_asset_cache)
+            if existing_note and not card_path.exists() and not options.force:
+                context = self._build_review_reading_context(project, row, options)
+                code_data = self._ai_code_paper(project.topic, row, context, existing_note, options)
+                card_md = self._card_from_zotero_note(row, existing_note, code_data=code_data)
+                card_path.write_text(card_md, encoding="utf-8")
+                coded_rows.append(self._coded_row_from_ai(row, code_data, card_path, "existing_zotero_note"))
+                self._save_reading_card_to_store(project, row, card_md, source="zotero_note")
+                result.updated += 1
+                continue
 
-            context = self._build_reading_context(project, row, options)
+            context = self._build_review_reading_context(project, row, options)
             reading_md = self._ai_read_paper(project.topic, row, context, options)
             code_data = self._ai_code_paper(project.topic, row, context, reading_md, options)
             card_md = self._format_reading_card(project.topic, row, reading_md, code_data)
             card_path.write_text(card_md, encoding="utf-8")
+            self._save_reading_card_to_store(project, row, card_md, source="review_read")
 
             coded_rows.append(self._coded_row_from_ai(row, code_data, card_path, "success"))
             if options.insert_zotero_notes:
-                self._write_zotero_note(row, card_md, project.slug)
+                if self._write_zotero_note(row, card_md, project.slug, zotero_asset_cache):
+                    result.updated += 1
             result.created += 1
 
         untouched = [row for row in _read_csv(project.path / "data/processed/paper_pool_coded.csv") if row.get("paper_id") not in {r.get("paper_id") for r in coded_rows}]
@@ -979,8 +1008,11 @@ class LiteratureReviewService:
             if not path.exists():
                 result.skipped += 1
                 continue
-            self.zotero.create_note(key, self._note_html(path.read_text(encoding="utf-8")), tags=[f"review:{project.slug}", "AI精读"])
-            result.created += 1
+            self._save_reading_card_to_store(project, row, path.read_text(encoding="utf-8"), source="review_sync")
+            if self._write_zotero_note(row, path.read_text(encoding="utf-8"), project.slug):
+                result.created += 1
+            else:
+                result.skipped += 1
         return result
 
     def curate_coded_pool(self, project: ReviewProject, options: ReviewCurateOptions) -> StageResult:
@@ -1108,11 +1140,12 @@ class LiteratureReviewService:
             if paper_id in paper_by_id and _tier_rank(paper_by_id[paper_id].get("tier", "")) == "D"
         )
         missing_cards = [row for row in core_rows if self._reading_card_flags(project, row, include_markers=False)]
+        verification_statuses = self._verified_fulltext_statuses(project)
         verification_rows = [
             row
             for row in core_rows
-            if any(_has_verification_marker(row.get(field, "")) for field in CODED_POOL_FIELDS)
-            or self._reading_card_flags(project, row, include_markers=True)
+            if self._coded_readiness_flags(row)
+            or self._fulltext_sensitive_reading_flags(project, row, verification_statuses)
         ]
         duplicate_keys = [
             key
@@ -1172,8 +1205,8 @@ class LiteratureReviewService:
             })
         if curated_mismatches:
             findings.append({
-                "severity": "warning",
-                "title": "paper_pool_coded.csv and paper_pool_curated.csv tiers differ",
+                "severity": "info",
+                "title": "curation preview differs from coded pool",
                 "detail": ", ".join(curated_mismatches[:20]),
             })
 
@@ -1196,6 +1229,7 @@ class LiteratureReviewService:
             cited_core_ids=cited_core_ids,
             unused_core=unused_core,
             verification_rows=verification_rows,
+            verification_statuses=verification_statuses,
             findings=findings,
             placeholder_count=_placeholder_count(draft_text),
         )
@@ -1332,7 +1366,7 @@ class LiteratureReviewService:
             fetch_rows.append(fetch_row)
             if fetch_row["oa_status"] in {"downloaded", "attached_to_zotero", "found_dry_run"}:
                 result.created += 1
-            elif fetch_row["oa_status"] == "existing_local_pdf":
+            elif fetch_row["oa_status"] in {"existing_local_pdf", "existing_zotero_pdf"}:
                 result.skipped += 1
             else:
                 result.updated += 1
@@ -1550,6 +1584,30 @@ class LiteratureReviewService:
             flags.append("needs_verification_markers")
         return flags
 
+    def _verified_fulltext_statuses(self, project: ReviewProject) -> dict[str, str]:
+        rows = _read_csv(project.path / "data/processed/fulltext_verification_queue.csv")
+        return {
+            str(row.get("paper_id") or ""): str(row.get("verification_status") or "")
+            for row in rows
+            if row.get("paper_id")
+        }
+
+    def _fulltext_sensitive_reading_flags(self, project: ReviewProject, row: dict[str, Any], verification_statuses: dict[str, str]) -> list[str]:
+        flags = self._reading_card_flags(project, row, include_markers=True)
+        if verification_statuses.get(str(row.get("paper_id") or "")) == "ready_local_pdf":
+            flags = [flag for flag in flags if flag != "needs_verification_markers"]
+        return flags
+
+    def _coded_readiness_flags(self, row: dict[str, Any]) -> list[str]:
+        flags: list[str] = []
+        if _has_verification_marker(row.get("relation_to_target_topic", "")):
+            flags.append("relation_needs_verification")
+        if str(row.get("coding_confidence") or "").lower() == "needs_verification":
+            flags.append("coding_confidence_needs_verification")
+        if str(row.get("status") or "").lower() == "needs_review":
+            flags.append("coded_status_needs_review")
+        return flags
+
     def _curated_tier_mismatches(self, coded_rows: list[dict[str, Any]], curated_rows: list[dict[str, Any]]) -> list[str]:
         if not curated_rows:
             return []
@@ -1585,6 +1643,7 @@ class LiteratureReviewService:
         cited_core_ids: set[str],
         unused_core: list[dict[str, Any]],
         verification_rows: list[dict[str, Any]],
+        verification_statuses: dict[str, str],
         findings: list[dict[str, str]],
         placeholder_count: int,
     ) -> None:
@@ -1647,7 +1706,8 @@ class LiteratureReviewService:
             if paper_id in unused_ids:
                 notes.append("not_cited")
             if paper_id in verification_ids:
-                notes.extend(self._reading_card_flags(project, row, include_markers=True) or ["needs_verification"])
+                notes.extend(self._coded_readiness_flags(row))
+                notes.extend(self._fulltext_sensitive_reading_flags(project, row, verification_statuses))
             if not notes:
                 notes.append("ok")
             card = "yes" if row.get("reading_card") and (project.path / str(row.get("reading_card"))).exists() else "missing"
@@ -1666,7 +1726,8 @@ class LiteratureReviewService:
         lines.extend(["", "## Needs Full-Text / Manual Verification"])
         if verification_rows:
             for row in verification_rows:
-                flags = self._reading_card_flags(project, row, include_markers=True) or ["coded_fields_need_verification"]
+                flags = self._coded_readiness_flags(row)
+                flags.extend(self._fulltext_sensitive_reading_flags(project, row, verification_statuses))
                 lines.append(f"- {row.get('paper_id')}: {row.get('title')} - {', '.join(dict.fromkeys(flags))}")
         else:
             lines.append("- No A/B paper has automated full-text or verification warnings.")
@@ -2033,6 +2094,25 @@ class LiteratureReviewService:
                 "fetch_error": "",
             }
 
+        zotero_pdf = self._existing_zotero_pdf_status(zotero_key)
+        if zotero_pdf.get("has_pdf") and not options.force:
+            return {
+                "paper_id": paper_id,
+                "citation_key": row.get("citation_key", ""),
+                "title": title,
+                "tier": row.get("tier", ""),
+                "doi": doi,
+                "arxiv_id": arxiv_id,
+                "zotero_key": zotero_key,
+                "oa_status": "existing_zotero_pdf",
+                "oa_source": "zotero",
+                "pdf_url": zotero_pdf.get("url", ""),
+                "landing_url": "",
+                "local_pdf_path": zotero_pdf.get("local_path", ""),
+                "attached_to_zotero": False,
+                "fetch_error": zotero_pdf.get("error", ""),
+            }
+
         lookup = oa_client.find_pdf(doi=doi, arxiv_id=arxiv_id)
         local_pdf_path = ""
         status = lookup.status
@@ -2352,6 +2432,135 @@ class LiteratureReviewService:
                     continue
         return "\n\n".join(part for part in parts if part.strip())
 
+    def _build_review_reading_context(self, project: ReviewProject, row: dict[str, str], options: ReviewReadOptions) -> str:
+        if options.force_read_pdf or options.summary_mode != "canonical" or self.summary_store is None:
+            return self._build_reading_context(project, row, options)
+        canonical = self._get_or_create_canonical_summary(project, row, options)
+        if canonical and canonical.full_summary_md:
+            facts = self.summary_store.list_facts(paper_id=canonical.paper_id, limit=40)
+            fact_lines = [
+                f"- {fact.fact_type}: {fact.context or fact.label}"
+                + (f" (evidence: {fact.evidence})" if fact.evidence else "")
+                for fact in facts
+            ]
+            return "\n\n".join(
+                part
+                for part in [
+                    f"Title: {row.get('title', '')}",
+                    f"Year: {row.get('year', '')}",
+                    f"Venue: {row.get('venue', '')}",
+                    f"DOI: {row.get('doi', '')}",
+                    f"arXiv: {row.get('arxiv_id', '')}",
+                    "Canonical AI Summary (cached; do not assume the original PDF is present in this review context):\n"
+                    + canonical.full_summary_md,
+                    "Extracted Facts:\n" + "\n".join(fact_lines) if fact_lines else "",
+                ]
+                if part
+            )
+        return self._build_reading_context(project, row, options)
+
+    def _get_or_create_canonical_summary(self, project: ReviewProject, row: dict[str, str], options: ReviewReadOptions) -> Optional[PaperSummary]:
+        if self.summary_store is None:
+            return None
+        zotero_key = row.get("zotero_key") or row.get("dedupe_key") or row.get("paper_id") or ""
+        canonical_key = self._canonical_key_for_row(row)
+        pdf_hash = self._project_pdf_hash(project, row) if options.use_local_pdfs else None
+        cached = None
+        if not options.force_summary:
+            cached = self.summary_store.get_valid_canonical(
+                zotero_key=zotero_key,
+                canonical_key=canonical_key,
+                summary_version=AI_SUMMARY_VERSION,
+                pdf_hash=pdf_hash,
+            )
+        if cached and cached.full_summary_md:
+            return cached
+        if not hasattr(self.ai, "summarize_paper_excerpt"):
+            return None
+
+        title = row.get("title") or row.get("paper_id") or "Untitled paper"
+        summary_service = SummaryService(
+            self.zotero,
+            self.ai,
+            project.path / "data/interim/pdfs",
+            deepxiv=self.deepxiv,
+            summary_store=self.summary_store,
+        )
+        if options.use_local_pdfs:
+            for pdf_path in _project_pdf_paths(project, row.get("paper_id", "")):
+                try:
+                    text = extract_pdf_text(pdf_path, options.pdf_max_pages)
+                    if not text.strip():
+                        continue
+                    pdf_hash = file_sha256(pdf_path)
+                    summary_service.summarize_text(
+                        title=title,
+                        text=text,
+                        zotero_key=zotero_key,
+                        options=SummaryOptions(
+                            max_pages=options.pdf_max_pages,
+                            max_chars=options.max_chars,
+                            locale=options.locale,
+                            force=options.force_summary,
+                            use_deepxiv=options.use_deepxiv,
+                            mode="general",
+                        ),
+                        source="pdf",
+                        canonical_key=canonical_key,
+                        pdf_hash=pdf_hash,
+                        insert_attachment=bool(self.zotero and zotero_key),
+                    )
+                    return self.summary_store.get_latest_canonical(
+                        zotero_key=zotero_key,
+                        canonical_key=canonical_key,
+                        summary_version=AI_SUMMARY_VERSION,
+                    )
+                except Exception:
+                    continue
+
+        abstract = (row.get("abstract") or "").strip()
+        if abstract:
+            summary_service.summarize_text(
+                title=title,
+                text=abstract,
+                zotero_key=zotero_key,
+                options=SummaryOptions(
+                    max_chars=min(options.max_chars, 4000),
+                    locale=options.locale,
+                    force=options.force_summary,
+                    mode="general",
+                ),
+                source="abstract",
+                canonical_key=canonical_key,
+                insert_attachment=bool(self.zotero and zotero_key),
+            )
+            return self.summary_store.get_latest_canonical(
+                zotero_key=zotero_key,
+                canonical_key=canonical_key,
+                summary_version=AI_SUMMARY_VERSION,
+            )
+        return None
+
+    def _canonical_key_for_row(self, row: dict[str, Any]) -> str:
+        return canonical_key_from_metadata(
+            {
+                "DOI": row.get("doi"),
+                "title": row.get("title"),
+                "url": row.get("arxiv_url") or row.get("paper_url"),
+                "archive": "arxiv" if row.get("arxiv_id") else "",
+                "archiveLocation": row.get("arxiv_id"),
+            },
+            row.get("title", ""),
+        ) or f"zotero:{row.get('zotero_key') or row.get('paper_id') or ''}"
+
+    def _project_pdf_hash(self, project: ReviewProject, row: dict[str, str]) -> Optional[str]:
+        for pdf_path in _project_pdf_paths(project, row.get("paper_id", "")):
+            try:
+                return file_sha256(pdf_path)
+            except Exception:
+                continue
+        return None
+
     def _ai_read_paper(self, topic: str, row: dict[str, str], context: str, options: ReviewReadOptions) -> str:
         if hasattr(self.ai, "read_paper_structured"):
             return str(
@@ -2366,7 +2575,14 @@ class LiteratureReviewService:
             ).strip()
         prompt = (
             f"请围绕综述主题“{topic}”阅读下面论文信息，生成中文 Markdown 精读卡片。"
-            "必须严格基于输入，不确定处标注 needs_verification。\n\n"
+            "必须严格基于输入，把输入视为有边界的证据包，不得把未提供的信息补写成事实。\n\n"
+            "证据规则：\n"
+            "- 数据集、baseline、指标、数值结果、代码、机器人平台、真实部署、消融实验等具体判断，句末必须给出短证据短语。\n"
+            "- 明确区分【作者原文事实】和【综述主题解释】；综述解释必须标注为“综述解读”。\n"
+            "- 如果论文与综述主题只是间接相关或弱相关，必须直接说明，不要强行归为主动探索或世界模型论文。\n"
+            "- 只有上下文明确显示抽取失败、相关章节缺失、或证据包不含该信息时，才写“需全文复核”；不要泛泛写“PDF截断”。\n"
+            "- needs_verification 只能绑定到具体缺失字段，例如“代码开源状态 needs_verification”，不要作为整篇免责声明。\n"
+            "- 非具身智能论文要先说明领域不匹配，再给跨域启发；不得把跨域启发写成作者贡献。\n\n"
             f"{context[: options.max_chars]}"
         )
         return str(
@@ -2406,7 +2622,14 @@ class LiteratureReviewService:
             "字段包括 priority_score,tier,research_direction,task_type,method_type,"
             "model_or_system_type,data_type,benchmark_or_environment,real_world_or_simulation,"
             "open_source_status,core_contribution,main_limitation,evidence_strength,"
-            "engineering_reusability,relation_to_target_topic,coding_confidence,coding_note。\n\n"
+            "engineering_reusability,relation_to_target_topic,coding_confidence,coding_note。"
+            "priority_score 必须是 0-100 的整数；coding_confidence 只能是 high, medium, low, needs_verification。"
+            "tier 只能使用 A 核心池, B 主体池, C 备选池, D 存档池。"
+            "只有直接研究具身 AI 中 active exploration + world models 的论文才评为 A；"
+            "基础 world model/RSSM/Dreamer 基础设施通常为 B；间接 baseline、survey、benchmark 通常为 C；"
+            "领域不匹配或仅跨域启发的论文为 D。不要因为推测性关联而升档。"
+            "relation_to_target_topic 必须说明“直接相关/间接相关/弱相关/不相关”，并给出证据依据；"
+            "不确定项只在对应字段写 needs_verification。\n\n"
             f"论文信息：\n{context[: options.max_chars]}\n\n精读笔记：\n{reading_md[:4000]}"
         )
         text = self.ai.chat(
@@ -2442,6 +2665,46 @@ class LiteratureReviewService:
             "reading_card": str(card_path.relative_to(card_path.parents[2])),
             "status": status,
         }
+
+    def _save_reading_card_to_store(self, project: ReviewProject, row: dict[str, str], card_md: str, *, source: str) -> None:
+        if self.summary_store is None or not card_md:
+            return
+        zotero_key = row.get("zotero_key") or row.get("dedupe_key") or row.get("paper_id") or ""
+        title = row.get("title") or row.get("paper_id") or "Untitled paper"
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        store_paper_id = f"review_{project.slug}_{row.get('paper_id') or 'paper'}_{timestamp}"
+        fields = extract_structured_fields(
+            card_md,
+            zotero_key=zotero_key,
+            title_hint=title,
+            locale="zh",
+            source=source,
+        )
+        fields.update(
+            {
+                "paper_id": store_paper_id,
+                "zotero_key": zotero_key,
+                "title": fields.get("title") or title,
+                "year": fields.get("year") or row.get("year"),
+                "authors": fields.get("authors") or row.get("authors"),
+                "summary_version": AI_SUMMARY_VERSION,
+                "summary_kind": "review_reading",
+                "review_slug": project.slug,
+                "canonical_key": self._canonical_key_for_row(row),
+                "summary_profile": "review",
+            }
+        )
+        facts = [
+            PaperSummaryFact(paper_id=store_paper_id, **fact)
+            for fact in extract_summary_facts(
+                card_md,
+                zotero_key=zotero_key,
+                title_hint=title,
+                source=source,
+                summary_version=AI_SUMMARY_VERSION,
+            )
+        ]
+        self.summary_store.save(PaperSummary(**fields), facts=facts)
 
     def _coded_row_from_ai(self, row: dict[str, str], code_data: dict[str, Any], card_path: Path, status: str) -> dict[str, Any]:
         default = self._default_coded_row(row, card_path, status)
@@ -2498,14 +2761,233 @@ class LiteratureReviewService:
 ```
 """
 
-    def _write_zotero_note(self, row: dict[str, str], card_md: str, slug: str) -> None:
+    def _zotero_review_assets(
+        self,
+        row: dict[str, str],
+        slug: str,
+        cache: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        key = row.get("zotero_key") or ""
+        empty = {
+            "has_pdf": False,
+            "pdf_url": "",
+            "pdf_local_path": "",
+            "review_note": "",
+            "versioned_review_note_key": "",
+            "versioned_review_note_version": 0,
+            "versioned_review_note": "",
+            "review_attachment": False,
+        }
+        if self.zotero is None or not key:
+            return empty
+        if cache is not None and key in cache:
+            return cache[key]
+        assets = dict(empty)
+        try:
+            children = self.zotero.fetch_children(key)
+        except Exception:
+            if cache is not None:
+                cache[key] = assets
+            return assets
+        for child in children:
+            data = child.get("data", child)
+            item_type = data.get("itemType")
+            if item_type == "attachment":
+                filename = str(data.get("filename") or "").lower()
+                if data.get("contentType") == "application/pdf" or filename.endswith(".pdf"):
+                    assets["has_pdf"] = True
+                    assets["pdf_url"] = str(data.get("url") or "")
+                    assets["pdf_local_path"] = str(data.get("path") or "")
+                if self._is_versioned_review_markdown_attachment(data, slug):
+                    assets["review_attachment"] = True
+            elif item_type == "note":
+                if self._is_review_note(data, slug):
+                    assets["review_note"] = str(data.get("note") or "")
+                if self._is_versioned_review_note(data, slug):
+                    assets["versioned_review_note"] = str(data.get("note") or "")
+                    assets["versioned_review_note_key"] = str(child.get("key") or data.get("key") or "")
+                    assets["versioned_review_note_version"] = int(child.get("version") or data.get("version") or 0)
+        if cache is not None:
+            cache[key] = assets
+        return assets
+
+    def _existing_zotero_pdf_status(self, zotero_key: str) -> dict[str, Any]:
+        status = {"has_pdf": False, "url": "", "local_path": "", "error": ""}
+        if self.zotero is None or not zotero_key:
+            return status
+        try:
+            children = self.zotero.fetch_children(zotero_key)
+        except Exception as exc:
+            status["error"] = f"{type(exc).__name__}: {exc}"
+            return status
+        for child in children:
+            data = child.get("data", child)
+            if data.get("itemType") != "attachment":
+                continue
+            filename = str(data.get("filename") or "").lower()
+            if data.get("contentType") != "application/pdf" and not filename.endswith(".pdf"):
+                continue
+            status["has_pdf"] = True
+            status["url"] = str(data.get("url") or "")
+            status["local_path"] = str(data.get("path") or "")
+            break
+        return status
+
+    def _is_review_note(self, data: dict[str, Any], slug: str) -> bool:
+        note_html = str(data.get("note") or "")
+        tags = {str(tag.get("tag") or "") for tag in data.get("tags") or [] if isinstance(tag, dict)}
+        if f"review:{slug}" in tags or "AI精读" in tags:
+            return True
+        if "AI总结" in tags:
+            return True
+        return "AI精读" in note_html or "AI总结" in note_html or "## AI 精读" in note_html or "结构化编码" in note_html
+
+    def _is_versioned_review_note(self, data: dict[str, Any], slug: str) -> bool:
+        note_html = str(data.get("note") or "")
+        tags = {str(tag.get("tag") or "") for tag in data.get("tags") or [] if isinstance(tag, dict)}
+        return (
+            versioned_ai_summary_label("AI精读") in tags
+            or versioned_ai_summary_label("AI总结") in tags
+            or versioned_ai_summary_label("AI精读") in note_html
+            or versioned_ai_summary_label("AI总结") in note_html
+            or f"AI总结版本：</strong>{AI_SUMMARY_VERSION}" in note_html
+            or f"AI总结版本：{AI_SUMMARY_VERSION}" in note_html
+        )
+
+    def _is_versioned_review_markdown_attachment(self, data: dict[str, Any], slug: str) -> bool:
+        tags = {str(tag.get("tag") or "") for tag in data.get("tags") or [] if isinstance(tag, dict)}
+        has_uploaded_file = bool(data.get("md5") or data.get("mtime"))
+        if not has_uploaded_file:
+            return False
+        if f"review:{slug}" in tags and f"{versioned_ai_summary_label('AI精读')}-md" in tags:
+            return True
+        title = str(data.get("title") or "")
+        filename = str(data.get("filename") or "")
+        return (
+            f"PaperPilot {versioned_ai_summary_label('AI精读')} Markdown - {slug}" in title
+            or filename.endswith(f"_{AI_SUMMARY_VERSION}.md")
+        )
+
+    def _existing_zotero_review_note(
+        self,
+        row: dict[str, str],
+        slug: str,
+        cache: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> str:
+        return str(self._zotero_review_assets(row, slug, cache).get("review_note") or "")
+
+    def _existing_zotero_versioned_review_note(
+        self,
+        row: dict[str, str],
+        slug: str,
+        cache: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> str:
+        return str(self._zotero_review_assets(row, slug, cache).get("versioned_review_note") or "")
+
+    def _card_from_zotero_note(self, row: dict[str, str], note_html: str, code_data: Optional[dict[str, Any]] = None) -> str:
+        text = html.unescape(re.sub(r"<[^>]+>", "\n", note_html or ""))
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if not text:
+            text = "Imported existing Zotero AI reading note."
+        code_block = ""
+        if code_data is not None:
+            code_block = f"""
+
+## 结构化编码
+
+```json
+{json.dumps(code_data, ensure_ascii=False, indent=2)}
+```
+"""
+        return f"""# {row.get('title', '')}
+
+## 基本信息
+
+- Paper ID: {row.get('paper_id', '')}
+- Citation Key: {row.get('citation_key', '')}
+- Year / Venue: {row.get('year', '')} / {row.get('venue', '')}
+- Zotero Key: {row.get('zotero_key', '')}
+
+## AI 精读
+
+{text}
+{code_block}
+"""
+
+    def _write_zotero_note(
+        self,
+        row: dict[str, str],
+        card_md: str,
+        slug: str,
+        cache: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> bool:
         if self.zotero is None or not row.get("zotero_key"):
-            return
-        self.zotero.create_note(row["zotero_key"], self._note_html(card_md), tags=[f"review:{slug}", "AI精读"])
+            return False
+        attachment_created = self._write_zotero_review_attachment(row, card_md, slug, cache)
+        if cache is not None and attachment_created:
+            cache.pop(row["zotero_key"], None)
+        return attachment_created
+
+    def _update_zotero_note_if_unreadable(self, row: dict[str, str], slug: str, note_html: str, assets: dict[str, Any]) -> bool:
+        existing = str(assets.get("versioned_review_note") or "")
+        if "<h2>" in existing or "<h3>" in existing or "<ul>" in existing:
+            return False
+        update_note = getattr(self.zotero, "update_note", None)
+        note_key = str(assets.get("versioned_review_note_key") or "")
+        version = int(assets.get("versioned_review_note_version") or 0)
+        if not callable(update_note) or not note_key or not version:
+            return False
+        update_note(note_key, version, note_html, tags=[f"review:{slug}", "AI精读", versioned_ai_summary_label("AI精读")])
+        return True
+
+    def _write_zotero_review_attachment(
+        self,
+        row: dict[str, str],
+        card_md: str,
+        slug: str,
+        cache: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> bool:
+        if self.zotero is None or not row.get("zotero_key"):
+            return False
+        assets = self._zotero_review_assets(row, slug, cache)
+        if assets.get("review_attachment"):
+            return False
+        create_file_attachment = getattr(self.zotero, "create_file_attachment", None)
+        if not callable(create_file_attachment):
+            return False
+        attachment_dir = Path(".paperpilot-zotero-attachments") / slug
+        attachment_dir.mkdir(parents=True, exist_ok=True)
+        paper_id = row.get("paper_id") or "paper"
+        md_path = attachment_dir / f"{paper_id}_{_safe_filename(row.get('title', 'paper'))}_{AI_SUMMARY_VERSION}.md"
+        md_path.write_text(card_md, encoding="utf-8")
+        create_file_attachment(
+            row["zotero_key"],
+            md_path,
+            title=f"PaperPilot {versioned_ai_summary_label('AI精读')} Markdown - {slug} - {paper_id}",
+            content_type="text/markdown",
+            tags=[f"review:{slug}", "AI精读附件", f"{versioned_ai_summary_label('AI精读')}-md"],
+        )
+        return True
 
     def _note_html(self, markdown_text: str) -> str:
-        safe_text = html.escape(markdown_text or "")
-        return f'<div data-markdown="true" data-mime-type="text/markdown" style="white-space:pre-wrap">{safe_text}</div>'
+        body = render_markdown_html(markdown_text or "")
+        return (
+            f"<h1>{html.escape(versioned_ai_summary_label('AI精读'))}</h1>"
+            f"<p><strong>AI总结版本：</strong>{html.escape(AI_SUMMARY_VERSION)}</p>"
+            f'<div style="line-height:1.55; font-size:13px">{body}</div>'
+        )
+
+    def _review_attachment_html(self, markdown_text: str) -> str:
+        body = render_markdown_html(markdown_text or "")
+        return (
+            "<!doctype html>\n"
+            f"<html><head><meta charset=\"utf-8\"><title>PaperPilot {html.escape(versioned_ai_summary_label('AI精读'))}</title></head>"
+            "<body style=\"font-family:system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height:1.55; max-width:980px; margin:32px auto; padding:0 24px\">"
+            f"<h1>{html.escape(versioned_ai_summary_label('AI精读'))}</h1>"
+            f"<p><strong>AI总结版本：</strong>{html.escape(AI_SUMMARY_VERSION)}</p>"
+            f"{body}"
+            "</body></html>\n"
+        )
 
     def _write_deep_reading_status(self, project: ReviewProject, coded_rows: list[dict[str, Any]]) -> None:
         layer_counts: dict[str, int] = {}

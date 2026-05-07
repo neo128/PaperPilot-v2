@@ -9,12 +9,15 @@ from paperpilot.services.summary_service import (
     find_pdf_attachments,
     normalize_arxiv_id,
     resolve_pdf_path,
+    make_note_html,
 )
+from paperpilot.storage.paper_summary_store import PaperSummaryStore
 
 
 class FakeZotero:
     def __init__(self):
         self.notes = []
+        self.attachments = []
 
     def fetch_children(self, parent_key):
         return []
@@ -22,10 +25,28 @@ class FakeZotero:
     def create_note(self, parent_key, note_html, tags=None):
         self.notes.append((parent_key, note_html, tags))
 
+    def create_file_attachment(self, parent_key, file_path, *, title=None, content_type=None, tags=None):
+        self.attachments.append((parent_key, title, str(file_path), content_type, tags))
+        return f"ATTACH{len(self.attachments)}"
+
 
 class FakeAI:
     def summarize_paper_excerpt(self, **kwargs):
-        return "# Summary\n\nThis is a test summary."
+        return """# 1. 论文基本信息
+
+- 标题：Paper
+- 年份：2026
+
+# 2. 一句话总结
+
+## 原文明确内容
+
+This is a test summary.
+
+# 8. 实验与结果
+
+- Accuracy reaches 91.2% on the benchmark.（91.2% benchmark result）
+"""
 
 
 class FakeDeepXiv:
@@ -65,6 +86,13 @@ class SummaryServiceHelpersTest(unittest.TestCase):
     def test_normalize_arxiv_id_handles_archive_location(self):
         self.assertEqual(normalize_arxiv_id("2604.11585v3.pdf"), "2604.11585")
 
+    def test_make_note_html_marks_ai_summary_version(self):
+        note_html = make_note_html("# Summary")
+
+        self.assertIn("AI总结-v2", note_html)
+        self.assertIn("AI总结版本：</strong>v2", note_html)
+        self.assertIn("<h1>Summary</h1>", note_html)
+
 
 class SummaryServiceTest(unittest.TestCase):
     def test_skip_when_no_pdf(self):
@@ -80,7 +108,27 @@ class SummaryServiceTest(unittest.TestCase):
         items = [{"data": {"key": "ITEMA", "title": "Paper", "itemType": "journalArticle", "abstractNote": "This is the abstract."}}]
         result = service.summarize_items(items, SummaryOptions(), insert_note=True)
         self.assertEqual(result.created, 1)
-        self.assertEqual(len(zotero.notes), 1)
+        self.assertEqual(zotero.notes, [])
+        self.assertEqual(len(zotero.attachments), 1)
+        self.assertEqual(zotero.attachments[0][3], "text/markdown")
+        self.assertIn("AI总结-v2-md", zotero.attachments[0][4])
+
+    def test_summary_writes_sqlite_record_and_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            zotero = FakeZotero()
+            service = SummaryService(zotero, FakeAI(), Path(tmp), summary_store=store)
+            items = [{"data": {"key": "ITEMA", "title": "Paper", "itemType": "journalArticle", "abstractNote": "This is the abstract."}}]
+
+            result = service.summarize_items(items, SummaryOptions(), insert_note=False)
+
+            self.assertEqual(result.created, 1)
+            self.assertTrue(store.has_summary("ITEMA"))
+            self.assertGreaterEqual(len(store.list_facts(fact_type="metric")), 1)
+            summary = store.get_by_zotero_key("ITEMA")
+            self.assertEqual(summary.summary_kind, "canonical")
+            self.assertEqual(summary.summary_profile, "general")
+            store.close()
 
     def test_use_deepxiv_before_pdf_fallback(self):
         zotero = FakeZotero()
@@ -88,7 +136,8 @@ class SummaryServiceTest(unittest.TestCase):
         items = [{"data": {"key": "ITEM2", "title": "Paper", "itemType": "journalArticle", "url": "https://arxiv.org/abs/2409.05591"}}]
         result = service.summarize_items(items, SummaryOptions(use_deepxiv=True), insert_note=True)
         self.assertEqual(result.created, 1)
-        self.assertEqual(len(zotero.notes), 1)
+        self.assertEqual(zotero.notes, [])
+        self.assertEqual(len(zotero.attachments), 1)
 
     def test_summarize_local_pdfs_to_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

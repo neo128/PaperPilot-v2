@@ -22,6 +22,7 @@ from paperpilot.services.review_service import (
     slugify,
 )
 from paperpilot.services.watch_service import WatchOptions, WatchService
+from paperpilot.storage.paper_summary_store import PaperSummaryStore
 from paperpilot.utils.config import AISettings, load_app_settings
 
 try:
@@ -62,6 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("--pdf-max-pages", type=int, default=12)
     read.add_argument("--paper-id", action="append", default=[], help="Read only a specific paper ID; repeatable.")
     read.add_argument("--model")
+    read.add_argument("--summary-db-path", default=".paperpilot/summaries.sqlite3", help="SQLite DB for review AI reading cards and extracted facts.")
+    read.add_argument("--summary-mode", choices=["canonical", "direct"], default="canonical", help="Use cached canonical AI summaries before review-specific reading.")
+    read.add_argument("--force-summary", action="store_true", help="Regenerate canonical summaries before review reading.")
+    read.add_argument("--force-read-pdf", action="store_true", help="Bypass canonical summaries and read available PDFs directly for review reading.")
 
     draft = sub.add_parser("draft", help="Draft review_v1.md from coded pool and reading cards")
     _add_project_args(draft)
@@ -101,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync = sub.add_parser("sync-zotero", help="Write generated reading cards back to Zotero notes")
     _add_project_args(sync)
+    sync.add_argument("--summary-db-path", default=".paperpilot/summaries.sqlite3", help="SQLite DB for synced reading cards and extracted facts.")
 
     run = sub.add_parser("run", help="Run search/import, pool build, AI reading, and draft")
     run.add_argument("--topic", required=True)
@@ -121,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-local-pdfs", action="store_true", help="Do not add project-local PDF text to reading context.")
     run.add_argument("--pdf-max-pages", type=int, default=12)
     run.add_argument("--model")
+    run.add_argument("--force-read", action="store_true", help="Regenerate reading cards and coded rows even when they already exist.")
     run.add_argument("--full", action="store_true", help="Run the full review automation chain around read/draft.")
     run.add_argument("--fetch-pdfs", action="store_true", help="Fetch open-access PDFs before AI reading.")
     run.add_argument("--verify", action="store_true", help="Build the full-text verification queue before AI reading.")
@@ -142,6 +149,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--verify-skip-zotero", action="store_true", help="Do not inspect Zotero child attachments during verify.")
     run.add_argument("--storage-dir", help="Override local Zotero storage directory for verify.")
     run.add_argument("--qc-draft-path", default="reports/review_draft.md", help="Draft path for QC, relative to project root or absolute.")
+    run.add_argument("--summary-db-path", default=".paperpilot/summaries.sqlite3", help="SQLite DB for all AI reading cards and extracted facts.")
+    run.add_argument("--summary-mode", choices=["canonical", "direct"], default="canonical", help="Use cached canonical AI summaries before review-specific reading.")
+    run.add_argument("--force-summary", action="store_true", help="Regenerate canonical summaries before review reading.")
+    run.add_argument("--force-read-pdf", action="store_true", help="Bypass canonical summaries and read available PDFs directly for review reading.")
     return parser
 
 
@@ -246,6 +257,10 @@ def _print_result(result) -> None:
     print(json.dumps(result.__dict__, ensure_ascii=False, indent=2, default=str))
 
 
+def _summary_store(args: argparse.Namespace) -> PaperSummaryStore:
+    return PaperSummaryStore(Path(args.summary_db_path).expanduser())
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args(_cli_args())
@@ -272,7 +287,8 @@ def main() -> None:
 
     if args.command == "read":
         _, zotero, ai, deepxiv = _settings_and_clients(args, need_ai=True, use_deepxiv=args.use_deepxiv)
-        service = LiteratureReviewService(ai=ai, zotero=zotero, deepxiv=deepxiv)
+        summary_store = _summary_store(args)
+        service = LiteratureReviewService(ai=ai, zotero=zotero, deepxiv=deepxiv, summary_store=summary_store)
         _print_result(
             service.read_and_code(
                 _project(args),
@@ -286,9 +302,13 @@ def main() -> None:
                     use_local_pdfs=not args.no_local_pdfs,
                     pdf_max_pages=args.pdf_max_pages,
                     paper_ids=tuple(args.paper_id),
+                    summary_mode=args.summary_mode,
+                    force_summary=args.force_summary,
+                    force_read_pdf=args.force_read_pdf,
                 ),
             )
         )
+        summary_store.close()
         return
 
     if args.command == "draft":
@@ -377,8 +397,10 @@ def main() -> None:
 
     if args.command == "sync-zotero":
         _, zotero, _, _ = _settings_and_clients(args)
-        service = LiteratureReviewService(zotero=zotero)
+        summary_store = _summary_store(args)
+        service = LiteratureReviewService(zotero=zotero, summary_store=summary_store)
         _print_result(service.sync_reading_notes_to_zotero(_project(args)))
+        summary_store.close()
         return
 
     if args.command == "run":
@@ -393,7 +415,8 @@ def main() -> None:
         if run_fetch_pdfs:
             email = args.unpaywall_email or os.environ.get("UNPAYWALL_EMAIL")
             open_access = OpenAccessClient(email=email)
-        service = LiteratureReviewService(ai=ai, zotero=zotero, deepxiv=deepxiv, open_access=open_access)
+        summary_store = _summary_store(args)
+        service = LiteratureReviewService(ai=ai, zotero=zotero, deepxiv=deepxiv, open_access=open_access, summary_store=summary_store)
         results = [service.init_project(project)]
 
         if args.watch_query or args.topic:
@@ -458,12 +481,16 @@ def main() -> None:
                 project,
                 ReviewReadOptions(
                     limit=args.limit,
+                    force=args.force_read,
                     locale=args.locale,
                     max_chars=args.max_chars,
                     use_deepxiv=args.use_deepxiv,
                     insert_zotero_notes=args.insert_zotero_notes,
                     use_local_pdfs=not args.no_local_pdfs,
                     pdf_max_pages=args.pdf_max_pages,
+                    summary_mode=args.summary_mode,
+                    force_summary=args.force_summary,
+                    force_read_pdf=args.force_read_pdf,
                 ),
             )
         )
@@ -486,6 +513,7 @@ def main() -> None:
         if run_qc:
             results.append(service.qc_review(project, ReviewQCOptions(draft_path=args.qc_draft_path)))
         print(json.dumps({"success": all(r.failed == 0 for r in results), "stages": [r.__dict__ for r in results]}, ensure_ascii=False, indent=2, default=str))
+        summary_store.close()
         return
 
     parser.print_help()

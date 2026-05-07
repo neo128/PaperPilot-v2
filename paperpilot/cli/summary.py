@@ -7,6 +7,7 @@ from pathlib import Path
 from paperpilot.clients.ai import AIClient
 from paperpilot.clients.zotero import ZoteroClient
 from paperpilot.services.summary_service import SummaryOptions, SummaryService
+from paperpilot.storage.paper_summary_store import PaperSummaryStore
 from paperpilot.utils.config import AISettings, load_app_settings
 
 try:
@@ -38,7 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-chars", type=int, default=12000)
     parser.add_argument("--note-tag", default="AI总结")
     parser.add_argument("--storage-dir", help="Override Zotero storage directory.")
+    parser.add_argument("--summary-db-path", default=".paperpilot/summaries.sqlite3", help="SQLite DB for AI summary records and extracted facts.")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force-summary", action="store_true", help="Regenerate canonical AI summaries even when cached.")
+    parser.add_argument("--mode", choices=["general", "brief"], default="general", help="AI summary profile for standalone summaries.")
+    parser.add_argument("--no-zotero-attachment", action="store_true", help="Do not upload generated Markdown summaries as Zotero attachments.")
     parser.add_argument("--locale", default="zh")
     parser.add_argument("--model", help="Override AI model.")
     parser.add_argument("--use-deepxiv", action="store_true", help="Use DeepXiv as the preferred structured paper source before PDF fallback.")
@@ -59,7 +64,8 @@ def main() -> None:
     )
     ai = AIClient(ai_settings)
     deepxiv = DeepXivClient() if args.use_deepxiv else None
-    service = SummaryService(zotero, ai, storage_dir, deepxiv=deepxiv)
+    summary_store = PaperSummaryStore(Path(args.summary_db_path).expanduser())
+    service = SummaryService(zotero, ai, storage_dir, deepxiv=deepxiv, summary_store=summary_store)
 
     if args.pdf_path:
         pdf_paths = [Path(p).expanduser() for p in args.pdf_path]
@@ -69,9 +75,11 @@ def main() -> None:
                 max_pages=args.max_pages,
                 max_chars=args.max_chars,
                 note_tag=args.note_tag,
-                force=args.force,
+                force=args.force or args.force_summary,
                 locale=args.locale,
                 use_deepxiv=args.use_deepxiv,
+                mode=args.mode,
+                attach_zotero=not args.no_zotero_attachment,
             ),
             summary_dir=Path(args.summary_dir).expanduser() if args.summary_dir else None,
         )
@@ -114,11 +122,13 @@ def main() -> None:
             max_pages=args.max_pages,
             max_chars=args.max_chars,
             note_tag=args.note_tag,
-            force=args.force,
+            force=args.force or args.force_summary,
             locale=args.locale,
             use_deepxiv=args.use_deepxiv,
+            mode=args.mode,
+            attach_zotero=not args.no_zotero_attachment,
         ),
-        insert_note=args.insert_note or not args.pdf_path,
+        insert_note=(args.insert_note or not args.pdf_path) and not args.no_zotero_attachment,
     )
     print(
         f"summary done, processed={result.processed}, created={result.created}, skipped={result.skipped}, failed={result.failed}"
@@ -127,6 +137,7 @@ def main() -> None:
         print("errors:")
         for err in result.errors:
             print(f"- {err}")
+    summary_store.close()
 
 
 if __name__ == "__main__":

@@ -83,6 +83,69 @@ def extract_structured_fields(
     }
 
 
+def extract_summary_facts(
+    markdown: str,
+    *,
+    zotero_key: str = "",
+    title_hint: str = "",
+    source: Optional[str] = None,
+    summary_version: Optional[str] = None,
+) -> list[dict]:
+    """Extract searchable facts, metrics, datasets, baselines, and evidence lines."""
+    facts: list[dict] = []
+    sections = _split_sections(markdown)
+    paper_title = _parse_basic_info(sections.get("1", ""), title_hint).get("title") or title_hint
+
+    for section_no, section_text in sections.items():
+        section_name = _section_label(section_no)
+        for line in _content_lines(section_text):
+            fact_type = _infer_fact_type(line, section_no)
+            if not fact_type:
+                continue
+            value, unit = _extract_numeric_value(line)
+            facts.append(
+                {
+                    "zotero_key": zotero_key,
+                    "title": paper_title,
+                    "fact_type": fact_type,
+                    "label": _fact_label(line),
+                    "value": value,
+                    "unit": unit,
+                    "context": line,
+                    "evidence": _extract_evidence_phrase(line),
+                    "confidence": _extract_confidence(line),
+                    "source_section": section_name,
+                    "source": source,
+                    "summary_version": summary_version,
+                }
+            )
+
+    # Fallback for shorter review cards that do not follow the numbered summary template.
+    if not facts:
+        for line in _content_lines(markdown):
+            fact_type = _infer_fact_type(line, "")
+            if not fact_type:
+                continue
+            value, unit = _extract_numeric_value(line)
+            facts.append(
+                {
+                    "zotero_key": zotero_key,
+                    "title": title_hint,
+                    "fact_type": fact_type,
+                    "label": _fact_label(line),
+                    "value": value,
+                    "unit": unit,
+                    "context": line,
+                    "evidence": _extract_evidence_phrase(line),
+                    "confidence": _extract_confidence(line),
+                    "source_section": "",
+                    "source": source,
+                    "summary_version": summary_version,
+                }
+            )
+    return facts
+
+
 def _split_sections(markdown: str) -> dict[str, str]:
     """Split markdown by `# N.` section headers."""
     pattern = re.compile(r"^#\s+\d+\.\s+", re.M)
@@ -138,6 +201,95 @@ def _parse_basic_info(section: str, title_hint: str) -> dict[str, str]:
             result[key] = m.group(1).strip()
 
     return result
+
+
+def _section_label(section_no: str) -> str:
+    labels = {
+        "1": "basic_info",
+        "2": "one_line_summary",
+        "3": "research_problem",
+        "4": "method_overview",
+        "5": "technical_route",
+        "6": "innovations",
+        "7": "technical_position",
+        "8": "experiments",
+        "9": "limitations",
+        "10": "failure_modes",
+        "11": "review_value",
+        "12": "tags",
+        "13": "embodied_ai_analysis",
+        "14": "research_opportunities",
+        "15": "evidence",
+    }
+    return labels.get(str(section_no), str(section_no))
+
+
+def _content_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("```"):
+            continue
+        line = re.sub(r"^[-*]\s*", "", line)
+        line = re.sub(r"^\d+[.)]\s*", "", line)
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _infer_fact_type(line: str, section_no: str) -> str:
+    lowered = line.lower()
+    if section_no == "15" or "证据" in line or "evidence" in lowered:
+        return "evidence"
+    if re.search(r"\d+(?:\.\d+)?\s*(?:%|percent|分|x|×|倍|fps|hz|ms|s|sec|seconds|hours|episodes|steps|trials|tasks|scenes|objects|environments|datasets)?", lowered):
+        return "metric"
+    if any(token in lowered for token in ["dataset", "benchmark", "数据集", "基准"]):
+        return "dataset"
+    if any(token in lowered for token in ["baseline", "baselines", "对比方法", "基线"]):
+        return "baseline"
+    if any(token in lowered for token in ["code", "github", "open-source", "开源", "代码"]):
+        return "code"
+    if any(token in lowered for token in ["robot", "机器人", "simulator", "simulation", "仿真", "real-world", "真实部署"]):
+        return "platform"
+    return ""
+
+
+def _extract_numeric_value(line: str) -> tuple[Optional[float], Optional[str]]:
+    match = re.search(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>%|percent|分|x|×|倍|fps|hz|ms|s|sec|seconds|hours|episodes|steps|trials|tasks|scenes|objects|environments|datasets)?", line, re.I)
+    if not match:
+        return None, None
+    value = float(match.group("value"))
+    unit = match.group("unit") or None
+    return value, unit
+
+
+def _extract_evidence_phrase(line: str) -> str:
+    bracket = re.search(r"[（(]([^()（）]{4,160})[）)]\s*$", line)
+    if bracket:
+        return bracket.group(1).strip()
+    quote = re.search(r"[“\"]([^”\"]{4,180})[”\"]", line)
+    if quote:
+        return quote.group(1).strip()
+    return ""
+
+
+def _extract_confidence(line: str) -> str:
+    lowered = line.lower()
+    if "needs_verification" in lowered or "需全文复核" in line:
+        return "needs_verification"
+    if "[原文]" in line or "原文" in line:
+        return "high"
+    if "[推断]" in line or "综述解读" in line:
+        return "medium"
+    if "[启发]" in line or "启发" in line:
+        return "low"
+    return ""
+
+
+def _fact_label(line: str) -> str:
+    cleaned = re.sub(r"\s+", " ", line).strip()
+    cleaned = re.sub(r"[：:].*$", "", cleaned) if len(cleaned) > 80 else cleaned
+    return cleaned[:180]
 
 
 def _clean(s: Optional[str]) -> Optional[str]:

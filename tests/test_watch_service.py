@@ -43,6 +43,7 @@ class FakeZotero:
         self.created_payloads = None
         self.existing = None
         self.added_to_collections = []
+        self.children = {}
 
     def create_collection_if_missing(self, name):
         return "COL123"
@@ -53,6 +54,9 @@ class FakeZotero:
     def add_item_to_collection(self, item_key, collection_key):
         self.added_to_collections.append((item_key, collection_key))
         return True
+
+    def fetch_children(self, parent_key):
+        return self.children.get(parent_key, [])
 
     def create_items(self, payloads):
         self.created_payloads = payloads
@@ -174,9 +178,51 @@ class WatchServiceTest(unittest.TestCase):
         self.assertTrue(all(limit == 2 for _, limit in deepxiv.calls))
         self.assertTrue(all(limit == 2 for _, limit in arxiv.calls))
 
+    def test_search_and_import_backfills_when_initial_search_underfills_limit(self):
+        zotero = FakeZotero()
+
+        class SparseArxiv:
+            def __init__(self):
+                self.calls = []
+
+            def search_recent(self, query, limit=10, days=30):
+                self.calls.append((query, limit))
+                idx = len(self.calls)
+                return [
+                    {
+                        "title": f"Backfill Paper {idx}",
+                        "authors": [{"name": "Ada"}],
+                        "abstract": "Active exploration and world models for embodied AI.",
+                        "src_url": f"https://arxiv.org/abs/2401.0000{idx}",
+                        "arxiv_id": f"2401.0000{idx}",
+                        "published": "2024-01-01",
+                    }
+                ]
+
+        arxiv = SparseArxiv()
+        service = WatchService(zotero=zotero, arxiv=arxiv)
+
+        result = service.search_and_import(
+            WatchOptions(
+                query="active exploration with world models in embodied AI",
+                prompt="robotics curiosity uncertainty information gain",
+                limit=3,
+                dry_run=True,
+            )
+        )
+
+        self.assertEqual(result.processed, 3)
+        self.assertEqual(result.created, 3)
+        self.assertGreaterEqual(len(arxiv.calls), 3)
+        self.assertTrue(result.artifacts["backfill_queries"])
+
     def test_search_and_import_reuses_existing_zotero_item(self):
         zotero = FakeZotero()
         zotero.existing = {"key": "EXISTING1", "data": {"key": "EXISTING1", "title": "Test Paper"}}
+        zotero.children["EXISTING1"] = [
+            {"data": {"itemType": "attachment", "contentType": "application/pdf", "filename": "paper.pdf"}},
+            {"data": {"itemType": "note", "note": "AI精读", "tags": [{"tag": "AI精读"}]}},
+        ]
         service = WatchService(zotero=zotero, deepxiv=FakeDeepXiv(), arxiv=FakeArxiv())
 
         result = service.search_and_import(WatchOptions(query="agent memory", dry_run=False))
@@ -187,6 +233,18 @@ class WatchServiceTest(unittest.TestCase):
         self.assertIsNone(zotero.created_payloads)
         self.assertEqual(result.artifacts["existing_keys"], ["EXISTING1"])
         self.assertEqual(result.artifacts["managed_keys"], ["EXISTING1"])
+        self.assertEqual(result.artifacts["missing_pdf_keys"], [])
+        self.assertEqual(result.artifacts["missing_ai_note_keys"], [])
+
+    def test_search_and_import_reports_missing_existing_assets(self):
+        zotero = FakeZotero()
+        zotero.existing = {"key": "EXISTING1", "data": {"key": "EXISTING1", "title": "Test Paper"}}
+        service = WatchService(zotero=zotero, deepxiv=FakeDeepXiv(), arxiv=FakeArxiv())
+
+        result = service.search_and_import(WatchOptions(query="agent memory", dry_run=False))
+
+        self.assertEqual(result.artifacts["missing_pdf_keys"], ["EXISTING1"])
+        self.assertEqual(result.artifacts["missing_ai_note_keys"], ["EXISTING1"])
 
     def test_search_and_import_adds_existing_item_to_collection(self):
         zotero = FakeZotero()

@@ -90,6 +90,42 @@ def build_literature_search_queries(topic: str, prompt: Optional[str] = None) ->
     return out
 
 
+def _backfill_search_queries(topic: str, prompt: Optional[str], existing_queries: list[str]) -> list[str]:
+    """Build broader fallback queries when the first-pass search underfills the limit."""
+    text = f"{topic} {prompt or ''}".lower()
+    candidates = [
+        topic,
+        "active exploration embodied AI",
+        "world models embodied AI",
+        "active perception robotics",
+        "model based reinforcement learning robotics",
+        "curiosity intrinsic motivation robotics",
+        "uncertainty information gain exploration",
+        "robot navigation active exploration",
+        "robot manipulation world models",
+        "latent dynamics planning robotics",
+        "RSSM Dreamer robotics",
+    ]
+    if "benchmark" in text or "survey" in text:
+        candidates.extend([
+            "embodied AI exploration benchmark",
+            "world model robotics survey",
+        ])
+
+    seen = {" ".join(query.split()).lower() for query in existing_queries}
+    out: list[str] = []
+    for query in candidates:
+        normalized = " ".join(query.split())
+        key = normalized.lower()
+        if not normalized or key in seen:
+            continue
+        if key != topic.lower() and not any(term in text for term in key.split()[:2]):
+            continue
+        seen.add(key)
+        out.append(normalized)
+    return out
+
+
 def _candidate_key(candidate: Dict[str, Any]) -> tuple[str, str]:
     doi = str(candidate.get("doi") or candidate.get("DOI") or "").strip().lower()
     if doi:
@@ -141,6 +177,36 @@ def build_zotero_item(candidate: Dict[str, Any], collection_key: Optional[str] =
     if collection_key:
         data["collections"] = [collection_key]
     return data
+
+
+def _child_data(child: dict[str, Any]) -> dict[str, Any]:
+    data = child.get("data")
+    return data if isinstance(data, dict) else child
+
+
+def _has_pdf_child(children: list[dict[str, Any]]) -> bool:
+    for child in children:
+        data = _child_data(child)
+        if data.get("itemType") != "attachment":
+            continue
+        filename = str(data.get("filename") or "").lower()
+        if data.get("contentType") == "application/pdf" or filename.endswith(".pdf"):
+            return True
+    return False
+
+
+def _has_ai_note_child(children: list[dict[str, Any]]) -> bool:
+    for child in children:
+        data = _child_data(child)
+        if data.get("itemType") != "note":
+            continue
+        note_html = str(data.get("note") or "")
+        tags = {str(tag.get("tag") or "") for tag in data.get("tags") or [] if isinstance(tag, dict)}
+        if {"AI总结", "AI精读"} & tags:
+            return True
+        if "AI总结" in note_html or "AI精读" in note_html or "## AI 精读" in note_html:
+            return True
+    return False
 
 
 class WatchService:
@@ -212,6 +278,28 @@ class WatchService:
             logger.warning("watch: failed to add existing Zotero item %s to collection %s (%s)", item_key, collection_key, exc)
             return False
 
+    def _existing_item_asset_status(self, item_key: str) -> dict[str, Any]:
+        status = {
+            "zotero_key": item_key,
+            "has_pdf": False,
+            "has_ai_note": False,
+            "needs_pdf": True,
+            "needs_ai_note": True,
+            "error": "",
+        }
+        if not item_key:
+            return status
+        try:
+            children = self.zotero.fetch_children(item_key)
+        except Exception as exc:
+            status["error"] = f"{type(exc).__name__}: {exc}"
+            return status
+        status["has_pdf"] = _has_pdf_child(children)
+        status["has_ai_note"] = _has_ai_note_child(children)
+        status["needs_pdf"] = not status["has_pdf"]
+        status["needs_ai_note"] = not status["has_ai_note"]
+        return status
+
     def search_and_import(self, options: WatchOptions) -> StageResult:
         """Search papers using DeepXiv (preferred) with arXiv fallback.
 
@@ -262,8 +350,22 @@ class WatchService:
             result.artifacts["per_query_limit"] = per_query_limit
             return result
 
+        backfill_queries: list[str] = []
+        candidates = deduplicate_candidates(candidates)
+        if 0 < len(candidates) < options.limit:
+            backfill_queries = _backfill_search_queries(options.query, options.prompt, queries)
+            remaining = options.limit - len(candidates)
+            for query in backfill_queries:
+                if remaining <= 0:
+                    break
+                query_candidates, source = self._search_candidates_for_query(query, min(options.limit, max(per_query_limit, remaining)))
+                candidates = deduplicate_candidates(candidates + query_candidates)
+                remaining = options.limit - len(candidates)
+                if query_candidates and source != "none":
+                    sources.append(source)
+
         source = "+".join(dict.fromkeys(sources)) if sources else "unknown"
-        candidates = deduplicate_candidates(candidates)[: options.limit]
+        candidates = candidates[: options.limit]
 
         collection_key = None
         if options.collection_name and options.create_collections and not options.dry_run:
@@ -272,6 +374,7 @@ class WatchService:
         payloads: List[Dict[str, Any]] = []
         existing_keys: List[str] = []
         managed_keys: List[str] = []
+        existing_asset_status: List[Dict[str, Any]] = []
         for candidate in candidates[: options.limit]:
             result.processed += 1
 
@@ -282,6 +385,7 @@ class WatchService:
                 if existing_key:
                     existing_keys.append(existing_key)
                     managed_keys.append(existing_key)
+                    existing_asset_status.append(self._existing_item_asset_status(existing_key))
                     if not options.dry_run and self._add_existing_to_collection(existing_key, collection_key):
                         result.updated += 1
                     result.skipped += 1
@@ -295,8 +399,13 @@ class WatchService:
             result.artifacts["source"] = source
             result.artifacts["queries"] = queries
             result.artifacts["per_query_limit"] = per_query_limit
+            result.artifacts["backfill_queries"] = backfill_queries
+            result.artifacts["candidate_count"] = len(candidates)
             result.artifacts["existing_keys"] = existing_keys
             result.artifacts["managed_keys"] = managed_keys
+            result.artifacts["existing_asset_status"] = existing_asset_status
+            result.artifacts["missing_pdf_keys"] = [row["zotero_key"] for row in existing_asset_status if row.get("needs_pdf")]
+            result.artifacts["missing_ai_note_keys"] = [row["zotero_key"] for row in existing_asset_status if row.get("needs_ai_note")]
             return result
 
         created_keys = self.zotero.create_items(payloads) if payloads else []
@@ -308,4 +417,9 @@ class WatchService:
         result.artifacts["source"] = source
         result.artifacts["queries"] = queries
         result.artifacts["per_query_limit"] = per_query_limit
+        result.artifacts["backfill_queries"] = backfill_queries
+        result.artifacts["candidate_count"] = len(candidates)
+        result.artifacts["existing_asset_status"] = existing_asset_status
+        result.artifacts["missing_pdf_keys"] = [row["zotero_key"] for row in existing_asset_status if row.get("needs_pdf")]
+        result.artifacts["missing_ai_note_keys"] = [row["zotero_key"] for row in existing_asset_status if row.get("needs_ai_note")]
         return result

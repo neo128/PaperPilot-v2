@@ -1,5 +1,5 @@
 from .sqlite_state import SQLiteStateStore
-from .paper_summary_store import PaperSummary, PaperSummaryStore
-from .summary_parser import extract_structured_fields
+from .paper_summary_store import PaperSummary, PaperSummaryFact, PaperSummaryStore
+from .summary_parser import extract_structured_fields, extract_summary_facts
 
-__all__ = ["SQLiteStateStore", "PaperSummary", "PaperSummaryStore", "extract_structured_fields"]
+__all__ = ["SQLiteStateStore", "PaperSummary", "PaperSummaryFact", "PaperSummaryStore", "extract_structured_fields", "extract_summary_facts"]

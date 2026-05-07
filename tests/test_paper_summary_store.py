@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryStore
+from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryFact, PaperSummaryStore
 from paperpilot.storage.summary_parser import extract_structured_fields
 
 
@@ -51,6 +51,42 @@ def test_store_create_and_save():
         assert retrieved.authors == "Alice, Bob"
         assert "new method for X" in (retrieved.one_line_summary or "")
         assert "fail to handle Y" in (retrieved.research_problem or "")
+
+        store.close()
+
+
+def test_store_saves_extracted_facts():
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "test.sqlite3"
+        store = PaperSummaryStore(db)
+
+        fields = extract_structured_fields(SAMPLE_MD, zotero_key="ABC123", title_hint="Test Paper")
+        fields["paper_id"] = "test_facts"
+        store.save(
+            PaperSummary(**fields),
+            facts=[
+                PaperSummaryFact(
+                    paper_id="test_facts",
+                    zotero_key="ABC123",
+                    title="Test Paper",
+                    fact_type="metric",
+                    label="Accuracy",
+                    value=91.2,
+                    unit="%",
+                    context="Accuracy reaches 91.2% on the benchmark.",
+                    evidence="91.2% on the benchmark",
+                    confidence="high",
+                    source_section="experiments",
+                    source="pdf",
+                    summary_version="v2",
+                )
+            ],
+        )
+
+        facts = store.list_facts(paper_id="test_facts")
+        assert len(facts) == 1
+        assert facts[0].fact_type == "metric"
+        assert facts[0].value == 91.2
 
         store.close()
 

@@ -18,11 +18,12 @@ from paperpilot.services.review_service import (
     ReviewVerifyOptions,
 )
 from paperpilot.clients.open_access import OAPdfResult
+from paperpilot.storage.paper_summary_store import PaperSummaryStore
 
 
 class FakeAI:
     def read_paper_structured(self, **kwargs):
-        return "## 研究问题\n测试研究问题。\n\n## 方法\n测试方法。"
+        return "## 研究问题\n测试研究问题。\n\n## 方法\n测试方法。\n\n## 实验与结果\n- Accuracy reaches 91.2% on the benchmark.（91.2% benchmark result）"
 
     def code_paper_for_review(self, **kwargs):
         return {
@@ -54,20 +55,65 @@ class InvalidCodingAI(FakeAI):
         }
 
 
+class CountingAI(FakeAI):
+    def __init__(self):
+        self.read_calls = 0
+        self.code_calls = 0
+
+    def read_paper_structured(self, **kwargs):
+        self.read_calls += 1
+        return super().read_paper_structured(**kwargs)
+
+    def code_paper_for_review(self, **kwargs):
+        self.code_calls += 1
+        return super().code_paper_for_review(**kwargs)
+
+
+class LayeredAI(CountingAI):
+    def __init__(self):
+        super().__init__()
+        self.summary_calls = 0
+
+    def summarize_paper_excerpt(self, **kwargs):
+        self.summary_calls += 1
+        return """# 1. 论文基本信息
+
+- 标题：Paper A
+
+# 2. 一句话总结
+
+## 原文明确内容
+
+Canonical summary.
+
+# 8. 实验与结果
+
+- Accuracy reaches 91.2% on the benchmark.（91.2% benchmark result）
+"""
+
+
 class FakeZotero:
     def __init__(self):
         self.notes = []
         self.children = {}
         self.attachments = []
+        self.updated_notes = []
 
     def create_note(self, parent_key, note_html, tags=None):
         self.notes.append((parent_key, note_html, tags))
+
+    def update_note(self, note_key, version, note_html, tags=None):
+        self.updated_notes.append((note_key, version, note_html, tags))
 
     def fetch_children(self, parent_key):
         return self.children.get(parent_key, [])
 
     def create_attachment_url(self, parent_key, title, url, content_type="application/pdf"):
         self.attachments.append((parent_key, title, url, content_type))
+
+    def create_file_attachment(self, parent_key, file_path, *, title=None, content_type=None, tags=None):
+        self.attachments.append((parent_key, title, str(file_path), content_type, tags))
+        return f"ATTACH{len(self.attachments)}"
 
 
 class FakeOA:
@@ -194,7 +240,47 @@ class LiteratureReviewServiceTest(unittest.TestCase):
             self.assertEqual(sync_result.created, 1)
             self.assertTrue((project.path / "data/processed/paper_pool_coded.csv").exists())
             self.assertTrue((project.path / "reports/review_draft.md").exists())
-            self.assertGreaterEqual(len(zotero.notes), 2)
+            self.assertEqual(zotero.notes, [])
+            self.assertGreaterEqual(len(zotero.attachments), 2)
+
+    def test_review_read_writes_sqlite_summary_and_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            ai = LayeredAI()
+            service = LiteratureReviewService(ai=ai, summary_store=store)
+            service.build_pool_from_zotero_items(project, [zotero_item("A", "Paper A", doi="10.123/a", abstract="Abstract text.")])
+
+            result = service.read_and_code(project, ReviewReadOptions(limit=1))
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(ai.summary_calls, 1)
+            self.assertEqual(store.count(), 2)
+            canonical = store.get_latest_canonical(zotero_key="A", summary_version="v2")
+            self.assertIsNotNone(canonical)
+            self.assertEqual(canonical.summary_kind, "canonical")
+            review_summary = store.get_by_zotero_key("A")
+            self.assertEqual(review_summary.summary_kind, "review_reading")
+            self.assertEqual(review_summary.review_slug, "agent-memory")
+            self.assertGreaterEqual(len(store.list_facts(fact_type="metric")), 1)
+            store.close()
+
+    def test_review_read_reuses_canonical_summary_without_regenerating(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            ai = LayeredAI()
+            service = LiteratureReviewService(ai=ai, summary_store=store)
+            service.build_pool_from_zotero_items(project, [zotero_item("A", "Paper A", doi="10.123/a", abstract="Abstract text.")])
+
+            first = service.read_and_code(project, ReviewReadOptions(limit=1))
+            second = service.read_and_code(project, ReviewReadOptions(limit=1, force=True))
+
+            self.assertEqual(first.created, 1)
+            self.assertEqual(second.created, 1)
+            self.assertEqual(ai.summary_calls, 1)
+            self.assertEqual(ai.read_calls, 2)
+            store.close()
 
     def test_read_and_code_marks_invalid_ai_coding_for_review(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,6 +300,130 @@ class LiteratureReviewServiceTest(unittest.TestCase):
             self.assertIn("priority_score_out_of_range", rows[0]["coding_note"])
             self.assertIn("invalid_tier", rows[0]["coding_note"])
             self.assertIn("missing_research_direction", rows[0]["coding_note"])
+
+    def test_read_and_code_refreshes_stale_card_after_fulltext_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            service = LiteratureReviewService(ai=FakeAI())
+            service.build_pool_from_zotero_items(project, [zotero_item("A", "Paper A", doi="10.123/a")])
+            card_path = project.path / "notes/core/P001_Paper_A.md"
+            card_path.write_text("metadata-only needs_verification\n", encoding="utf-8")
+            with (project.path / "data/processed/fulltext_verification_queue.csv").open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=FULLTEXT_VERIFICATION_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerow({"paper_id": "P001", "verification_status": "ready_local_pdf"})
+
+            result = service.read_and_code(project, ReviewReadOptions(limit=1))
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(result.skipped, 0)
+            self.assertIn("## AI 精读", card_path.read_text(encoding="utf-8"))
+
+    def test_read_and_code_reuses_existing_zotero_review_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            zotero = FakeZotero()
+            ai = CountingAI()
+            zotero.children["A"] = [
+                {
+                    "data": {
+                        "itemType": "note",
+                        "note": "<div>Existing Zotero AI总结 note</div>",
+                        "tags": [{"tag": "AI总结"}],
+                    }
+                }
+            ]
+            service = LiteratureReviewService(ai=ai, zotero=zotero)
+            service.build_pool_from_zotero_items(project, [zotero_item("A", "Paper A", doi="10.123/a")])
+
+            result = service.read_and_code(project, ReviewReadOptions(limit=1))
+
+            self.assertEqual(result.created, 0)
+            self.assertEqual(result.updated, 1)
+            self.assertEqual(ai.read_calls, 0)
+            self.assertEqual(ai.code_calls, 1)
+            card_path = project.path / "notes/core/P001_Paper_A.md"
+            self.assertIn("Existing Zotero AI总结 note", card_path.read_text(encoding="utf-8"))
+            self.assertIn("## 结构化编码", card_path.read_text(encoding="utf-8"))
+
+    def test_sync_reading_notes_to_zotero_adds_v2_markdown_attachment_when_only_old_note_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            zotero = FakeZotero()
+            zotero.children["A"] = [
+                {
+                    "data": {
+                        "itemType": "note",
+                        "note": "<div>Existing Zotero AI精读 note</div>",
+                        "tags": [{"tag": "review:agent-memory"}, {"tag": "AI精读"}],
+                    }
+                }
+            ]
+            service = LiteratureReviewService(ai=FakeAI(), zotero=zotero)
+            service.build_pool_from_zotero_items(project, [zotero_item("A", "Paper A", doi="10.123/a")])
+            service.read_and_code(project, ReviewReadOptions(limit=1, force=True))
+
+            result = service.sync_reading_notes_to_zotero(project)
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(result.skipped, 0)
+            self.assertEqual(zotero.notes, [])
+            self.assertEqual(len(zotero.attachments), 1)
+            self.assertEqual(zotero.attachments[0][3], "text/markdown")
+            self.assertIn("AI精读-v2", zotero.attachments[0][1])
+            self.assertIn("Markdown", zotero.attachments[0][1])
+            self.assertIn("_v2.md", zotero.attachments[0][2])
+            self.assertIn("AI精读-v2-md", zotero.attachments[0][4])
+
+    def test_sync_reading_notes_to_zotero_ignores_bad_note_and_adds_markdown_attachment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            zotero = FakeZotero()
+            zotero.children["A"] = [
+                {
+                    "key": "NOTE1",
+                    "version": 7,
+                    "data": {
+                        "key": "NOTE1",
+                        "version": 7,
+                        "itemType": "note",
+                        "note": "<h1>AI精读-v2</h1>## Raw Heading\n- raw bullet",
+                        "tags": [{"tag": "review:agent-memory"}, {"tag": "AI精读-v2"}],
+                    },
+                }
+            ]
+            service = LiteratureReviewService(ai=FakeAI(), zotero=zotero)
+            service.build_pool_from_zotero_items(project, [zotero_item("A", "Paper A", doi="10.123/a")])
+            service.read_and_code(project, ReviewReadOptions(limit=1, force=True))
+
+            result = service.sync_reading_notes_to_zotero(project)
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(zotero.updated_notes, [])
+            self.assertEqual(len(zotero.attachments), 1)
+            self.assertEqual(zotero.attachments[0][3], "text/markdown")
+
+    def test_fetch_pdfs_skips_when_zotero_pdf_already_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="agent-memory", topic="agent memory", root=Path(tmp))
+            zotero = FakeZotero()
+            zotero.children["A"] = [
+                {
+                    "data": {
+                        "itemType": "attachment",
+                        "contentType": "application/pdf",
+                        "filename": "paper.pdf",
+                        "url": "https://example.com/paper.pdf",
+                    }
+                }
+            ]
+            service = LiteratureReviewService(zotero=zotero, open_access=FakeOA())
+            service.build_pool_from_zotero_items(project, [zotero_item("A", "Paper A", doi="10.123/a")])
+
+            result = service.fetch_open_access_pdfs(project, ReviewFetchPdfOptions())
+
+            self.assertEqual(result.skipped, 1)
+            self.assertEqual(result.artifacts["status_counts"], {"existing_zotero_pdf": 1})
 
     def test_curate_coded_pool_downgrades_off_topic(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -385,6 +595,47 @@ class LiteratureReviewServiceTest(unittest.TestCase):
             self.assertIn("P003", report)
             self.assertIn("A/B papers not cited in draft", report)
             self.assertIn("MissingKey2026", report)
+
+    def test_qc_review_does_not_warn_on_generic_card_markers_when_fulltext_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = ReviewProject(slug="world-models", topic="taxonomy of world models for embodied AI", root=Path(tmp))
+            service = LiteratureReviewService()
+            service.init_project(project)
+            card_path = project.path / "notes/core/P001_card.md"
+            card_path.write_text("code availability needs_verification\n", encoding="utf-8")
+            coded_path = project.path / "data/processed/paper_pool_coded.csv"
+            with coded_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=CODED_POOL_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerow({
+                    "paper_id": "P001",
+                    "title": "Core robot world model",
+                    "priority_score": "90",
+                    "tier": "A 核心池",
+                    "citation_key": "Core2026WorldModel",
+                    "relation_to_target_topic": "high",
+                    "coding_confidence": "high",
+                    "reading_card": "notes/core/P001_card.md",
+                })
+            with (project.path / "data/processed/fulltext_verification_queue.csv").open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=FULLTEXT_VERIFICATION_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerow({"paper_id": "P001", "verification_status": "ready_local_pdf"})
+            (project.path / "bib/citation_keys.csv").write_text(
+                "paper_id,citation_key,title,year,zotero_key\nP001,Core2026WorldModel,Core robot world model,2026,\n",
+                encoding="utf-8",
+            )
+            (project.path / "bib/references.bib").write_text("@article{Core2026WorldModel,\n}\n", encoding="utf-8")
+            (project.path / "reports/review_draft.md").write_text(
+                "# Draft\n\n## 分类框架\nEvidence uses [P001] Core2026WorldModel.\n",
+                encoding="utf-8",
+            )
+
+            result = service.qc_review(project, ReviewQCOptions())
+
+            self.assertFalse(
+                any(item["title"] == "A/B papers still carry needs_verification or metadata-only markers" for item in result.artifacts["findings"])
+            )
 
     def test_build_matrices_excludes_d_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:

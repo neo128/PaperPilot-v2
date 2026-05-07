@@ -45,6 +45,33 @@ class PaperSummary:
     model: Optional[str] = None
     created_at: Optional[str] = None
     source: Optional[str] = None  # e.g. "pdf", "deepxiv", "abstract"
+    summary_version: Optional[str] = None
+    summary_kind: Optional[str] = None  # e.g. "summary", "review_reading"
+    review_slug: Optional[str] = None
+    pdf_hash: Optional[str] = None
+    canonical_key: Optional[str] = None
+    summary_profile: Optional[str] = None
+    source_priority: Optional[int] = None
+    stale_reason: Optional[str] = None
+
+
+@dataclass
+class PaperSummaryFact:
+    """Searchable atomic fact extracted from an AI-generated summary."""
+    paper_id: str
+    zotero_key: str
+    title: Optional[str] = None
+    fact_type: str = ""
+    label: str = ""
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    context: Optional[str] = None
+    evidence: Optional[str] = None
+    confidence: Optional[str] = None
+    source_section: Optional[str] = None
+    source: Optional[str] = None
+    summary_version: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class PaperSummaryStore:
@@ -106,13 +133,70 @@ class PaperSummaryStore:
                 locale TEXT DEFAULT 'zh',
                 model TEXT,
                 created_at TEXT NOT NULL,
-                source TEXT
+                source TEXT,
+                summary_version TEXT,
+                summary_kind TEXT,
+                review_slug TEXT,
+                pdf_hash TEXT,
+                canonical_key TEXT,
+                summary_profile TEXT,
+                source_priority INTEGER,
+                stale_reason TEXT
             );
+            CREATE TABLE IF NOT EXISTS paper_summary_facts (
+                fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id TEXT NOT NULL,
+                zotero_key TEXT NOT NULL,
+                title TEXT,
+                fact_type TEXT NOT NULL,
+                label TEXT,
+                value REAL,
+                unit TEXT,
+                context TEXT,
+                evidence TEXT,
+                confidence TEXT,
+                source_section TEXT,
+                source TEXT,
+                summary_version TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(paper_id) REFERENCES paper_summaries(paper_id) ON DELETE CASCADE
+            );
+            """)
+        # Backward-compat: add columns if table existed before migration.
+        for col in [
+            "tech_coordination",
+            "failure_modes",
+            "robot_task_modeling",
+            "data_and_platform",
+            "perception_decision_control",
+            "generalization_deployment",
+            "summary_version",
+            "summary_kind",
+            "review_slug",
+            "pdf_hash",
+            "canonical_key",
+            "summary_profile",
+            "source_priority",
+            "stale_reason",
+        ]:
+            try:
+                self.conn.execute(f"ALTER TABLE paper_summaries ADD COLUMN {col} TEXT DEFAULT ''")
+            except Exception:
+                pass
+        self.conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_summaries_zotero ON paper_summaries(zotero_key);
             CREATE INDEX IF NOT EXISTS idx_summaries_title ON paper_summaries(title);
             CREATE INDEX IF NOT EXISTS idx_summaries_field ON paper_summaries(field);
             CREATE INDEX IF NOT EXISTS idx_summaries_task_type ON paper_summaries(task_type);
             CREATE INDEX IF NOT EXISTS idx_summaries_created ON paper_summaries(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_summaries_kind ON paper_summaries(summary_kind);
+            CREATE INDEX IF NOT EXISTS idx_summaries_review_slug ON paper_summaries(review_slug);
+            CREATE INDEX IF NOT EXISTS idx_summaries_canonical ON paper_summaries(canonical_key);
+            CREATE INDEX IF NOT EXISTS idx_summaries_pdf_hash ON paper_summaries(pdf_hash);
+            CREATE INDEX IF NOT EXISTS idx_summary_facts_paper ON paper_summary_facts(paper_id);
+            CREATE INDEX IF NOT EXISTS idx_summary_facts_zotero ON paper_summary_facts(zotero_key);
+            CREATE INDEX IF NOT EXISTS idx_summary_facts_type ON paper_summary_facts(fact_type);
+            CREATE INDEX IF NOT EXISTS idx_summary_facts_label ON paper_summary_facts(label);
             CREATE VIRTUAL TABLE IF NOT EXISTS paper_summaries_fts
                 USING fts5(title, one_line_summary, research_problem, method_overview, innovations, experiments,
                            content='paper_summaries', content_rowid='rowid');
@@ -123,16 +207,9 @@ class PaperSummaryStore:
                     new.method_overview, new.innovations, new.experiments);
             END;
             """)
-        # Backward-compat: add columns if table existed before migration
-        for col in ["tech_coordination", "failure_modes", "robot_task_modeling",
-                    "data_and_platform", "perception_decision_control", "generalization_deployment"]:
-            try:
-                self.conn.execute(f"ALTER TABLE paper_summaries ADD COLUMN {col} TEXT DEFAULT ''")
-            except Exception:
-                pass
         self.conn.commit()
 
-    def save(self, summary: PaperSummary) -> None:
+    def save(self, summary: PaperSummary, facts: Optional[list[PaperSummaryFact]] = None) -> None:
         self.conn.execute(
             """
             INSERT INTO paper_summaries (
@@ -142,8 +219,10 @@ class PaperSummaryStore:
                 experiments, limitations, failure_modes, review_value, tags,
                 robot_task_modeling, data_and_platform, perception_decision_control,
                 generalization_deployment, research_opportunities,
-                evidence, full_summary_md, locale, model, created_at, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                evidence, full_summary_md, locale, model, created_at, source,
+                summary_version, summary_kind, review_slug, pdf_hash, canonical_key,
+                summary_profile, source_priority, stale_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary.paper_id,
@@ -177,9 +256,46 @@ class PaperSummaryStore:
                 summary.model,
                 summary.created_at or utc_now(),
                 summary.source,
+                summary.summary_version,
+                summary.summary_kind,
+                summary.review_slug,
+                summary.pdf_hash,
+                summary.canonical_key,
+                summary.summary_profile,
+                summary.source_priority,
+                summary.stale_reason,
             ),
         )
+        for fact in facts or []:
+            self.save_fact(fact)
         self.conn.commit()
+
+    def save_fact(self, fact: PaperSummaryFact) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_summary_facts (
+                paper_id, zotero_key, title, fact_type, label, value, unit,
+                context, evidence, confidence, source_section, source,
+                summary_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fact.paper_id,
+                fact.zotero_key,
+                fact.title,
+                fact.fact_type,
+                fact.label,
+                fact.value,
+                fact.unit,
+                fact.context,
+                fact.evidence,
+                fact.confidence,
+                fact.source_section,
+                fact.source,
+                fact.summary_version,
+                fact.created_at or utc_now(),
+            ),
+        )
 
     def get_by_zotero_key(self, zotero_key: str) -> Optional[PaperSummary]:
         row = self.conn.execute(
@@ -189,6 +305,53 @@ class PaperSummaryStore:
         if not row:
             return None
         return self._row_to_summary(row)
+
+    def get_latest_canonical(
+        self,
+        *,
+        zotero_key: str = "",
+        canonical_key: str = "",
+        summary_version: str = "",
+    ) -> Optional[PaperSummary]:
+        clauses = ["summary_kind = 'canonical'", "COALESCE(stale_reason, '') = ''"]
+        params: list[object] = []
+        key_clauses: list[str] = []
+        if zotero_key:
+            key_clauses.append("zotero_key = ?")
+            params.append(zotero_key)
+        if canonical_key:
+            key_clauses.append("canonical_key = ?")
+            params.append(canonical_key)
+        if not key_clauses:
+            return None
+        clauses.append("(" + " OR ".join(key_clauses) + ")")
+        if summary_version:
+            clauses.append("summary_version = ?")
+            params.append(summary_version)
+        row = self.conn.execute(
+            f"SELECT * FROM paper_summaries WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        return self._row_to_summary(row) if row else None
+
+    def get_valid_canonical(
+        self,
+        *,
+        zotero_key: str = "",
+        canonical_key: str = "",
+        summary_version: str,
+        pdf_hash: Optional[str] = None,
+    ) -> Optional[PaperSummary]:
+        summary = self.get_latest_canonical(
+            zotero_key=zotero_key,
+            canonical_key=canonical_key,
+            summary_version=summary_version,
+        )
+        if summary is None:
+            return None
+        if pdf_hash and summary.pdf_hash and summary.pdf_hash != pdf_hash:
+            return None
+        return summary
 
     def has_summary(self, zotero_key: str) -> bool:
         row = self.conn.execute(
@@ -221,7 +384,24 @@ class PaperSummaryStore:
         row = self.conn.execute("SELECT COUNT(*) as c FROM paper_summaries").fetchone()
         return row["c"] if row else 0
 
+    def list_facts(self, paper_id: Optional[str] = None, fact_type: Optional[str] = None, limit: int = 100) -> list[PaperSummaryFact]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if paper_id:
+            clauses.append("paper_id = ?")
+            params.append(paper_id)
+        if fact_type:
+            clauses.append("fact_type = ?")
+            params.append(fact_type)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM paper_summary_facts{where} ORDER BY created_at DESC, fact_id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [self._row_to_fact(row) for row in rows]
+
     def delete(self, paper_id: str) -> bool:
+        self.conn.execute("DELETE FROM paper_summary_facts WHERE paper_id = ?", (paper_id,))
         cursor = self.conn.execute("DELETE FROM paper_summaries WHERE paper_id = ?", (paper_id,))
         self.conn.commit()
         return cursor.rowcount > 0
@@ -260,4 +440,31 @@ class PaperSummaryStore:
             model=row["model"],
             created_at=row["created_at"],
             source=row["source"],
+            summary_version=row["summary_version"],
+            summary_kind=row["summary_kind"],
+            review_slug=row["review_slug"],
+            pdf_hash=row["pdf_hash"],
+            canonical_key=row["canonical_key"],
+            summary_profile=row["summary_profile"],
+            source_priority=row["source_priority"],
+            stale_reason=row["stale_reason"],
+        )
+
+    @staticmethod
+    def _row_to_fact(row: sqlite3.Row) -> PaperSummaryFact:
+        return PaperSummaryFact(
+            paper_id=row["paper_id"],
+            zotero_key=row["zotero_key"],
+            title=row["title"],
+            fact_type=row["fact_type"],
+            label=row["label"],
+            value=row["value"],
+            unit=row["unit"],
+            context=row["context"],
+            evidence=row["evidence"],
+            confidence=row["confidence"],
+            source_section=row["source_section"],
+            source=row["source"],
+            summary_version=row["summary_version"],
+            created_at=row["created_at"],
         )

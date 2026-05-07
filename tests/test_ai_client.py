@@ -45,6 +45,54 @@ class AIClientPromptTest(unittest.TestCase):
         self.assertEqual(ai.last_kwargs["model"], "test-model")
         self.assertEqual(ai.last_kwargs["temperature"], 0.15)
 
+    def test_structured_reading_prompt_requires_grounded_topic_fit(self):
+        ai = CapturingAIClient()
+
+        result = ai.read_paper_structured(
+            topic="active exploration with world models in embodied AI",
+            title="Static Analysis Paper",
+            metadata={"year": "2026"},
+            context="This paper studies static analysis for Rust programs.",
+            locale="zh",
+            max_chars=12000,
+            model="test-model",
+        )
+
+        self.assertEqual(result, "generated summary")
+        self.assertIsNotNone(ai.last_messages)
+        prompt = ai.last_messages[1]["content"]
+
+        self.assertIn("有边界的证据包", prompt)
+        self.assertIn("间接相关/弱相关", prompt)
+        self.assertIn("不要强行称其为主动探索或世界模型论文", prompt)
+        self.assertIn("不要泛泛写“PDF截断”", prompt)
+        self.assertIn("needs_verification 必须绑定到具体缺失项", prompt)
+        self.assertIn("不得把跨域启发写成作者贡献", prompt)
+
+    def test_review_coding_prompt_constrains_scores_and_tiers(self):
+        ai = CapturingAIClient()
+
+        result = ai.code_paper_for_review(
+            topic="active exploration with world models in embodied AI",
+            title="Indirect Benchmark Paper",
+            metadata={"venue": "arXiv"},
+            context="The paper proposes a benchmark.",
+            reading_note="Indirectly related.",
+            locale="zh",
+            max_chars=12000,
+            model="test-model",
+        )
+
+        self.assertEqual(result, {})
+        self.assertIsNotNone(ai.last_messages)
+        prompt = ai.last_messages[1]["content"]
+
+        self.assertIn("priority_score must be an integer from 0 to 100", prompt)
+        self.assertIn("coding_confidence must be one of high, medium, low, needs_verification", prompt)
+        self.assertIn("A paper should be A only if it directly studies active exploration with world models in embodied AI", prompt)
+        self.assertIn("C for indirect baselines/surveys", prompt)
+        self.assertIn("Do not upgrade an indirect paper by speculative relation", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
