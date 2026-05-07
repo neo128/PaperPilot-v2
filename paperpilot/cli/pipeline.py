@@ -5,6 +5,7 @@ import json
 import sys
 
 from paperpilot.pipeline import NotionStageConfig, PipelineConfig, PipelineOrchestrator, SummaryStageConfig, WatchStageConfig
+from paperpilot.utils.run_logging import log_pipeline_result
 
 
 def _cli_args() -> list[str]:
@@ -72,6 +73,7 @@ def main() -> None:
         ),
     )
     result = PipelineOrchestrator(config).run()
+    log_pipeline_result(result)
     print(json.dumps({
         "success": result.success,
         "stages": [stage.__dict__ for stage in result.stages],

@@ -3,8 +3,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryFact, PaperSummaryStore
-from paperpilot.storage.summary_parser import extract_structured_fields
+from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryFact, PaperSummaryFigure, PaperSummaryStore
+from paperpilot.storage.summary_parser import extract_structured_fields, extract_summary_facts
 
 
 SAMPLE_MD = """# 1. 论文基本信息
@@ -91,6 +91,39 @@ def test_store_saves_extracted_facts():
         store.close()
 
 
+def test_store_saves_extracted_figures():
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "test.sqlite3"
+        store = PaperSummaryStore(db)
+
+        fields = extract_structured_fields(SAMPLE_MD, zotero_key="ABC123", title_hint="Test Paper")
+        fields["paper_id"] = "test_figures"
+        store.save(
+            PaperSummary(**fields),
+            figures=[
+                PaperSummaryFigure(
+                    paper_id="test_figures",
+                    zotero_key="ABC123",
+                    title="Test Paper",
+                    figure_index=1,
+                    page=2,
+                    file_path="/tmp/fig_001.png",
+                    caption="Figure 1. System architecture",
+                    figure_type="architecture",
+                    relevance="candidate",
+                    summary_version="v2",
+                )
+            ],
+        )
+
+        figures = store.list_figures(paper_id="test_figures")
+        assert len(figures) == 1
+        assert figures[0].page == 2
+        assert figures[0].figure_type == "architecture"
+
+        store.close()
+
+
 def test_store_has_summary():
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "test.sqlite3"
@@ -152,3 +185,34 @@ def test_parser_section_split():
     assert sections["task_type"] == "classification"
     assert sections["one_line_summary"] == "This paper proposes a new method for X."
     assert sections["research_problem"] is not None
+
+
+def test_fact_extraction_uses_conservative_confidence_rules():
+    md = """# 1. 论文基本信息
+
+- 标题：Theory Paper
+- 年份：2026
+
+# 3. 研究问题
+
+- This theoretical paper discusses digital platforms and 3 attention regimes.
+
+# 8. 实验与结果
+
+- Top-1 accuracy reaches 91.2% on Habitat benchmark.（原文）
+- The benchmark includes 12 tasks and 30 scenes.（原文）
+
+# 13. 跨域适配与具身智能启发
+
+- [原文] The method is evaluated in the Habitat simulator.
+- [启发] Habitat simulator may be a relevant comparison platform for future work.
+"""
+
+    facts = extract_summary_facts(md, title_hint="Theory Paper")
+    metric_contexts = [fact["context"] for fact in facts if fact["fact_type"] == "metric"]
+    platform_contexts = [fact["context"] for fact in facts if fact["fact_type"] == "platform"]
+
+    assert not any("digital platforms" in context for context in metric_contexts + platform_contexts)
+    assert not any("[启发]" in context for context in metric_contexts + platform_contexts)
+    assert any("91.2%" in context for context in metric_contexts)
+    assert any("[原文] The method is evaluated in the Habitat simulator." in context for context in platform_contexts)

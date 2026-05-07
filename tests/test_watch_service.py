@@ -139,6 +139,31 @@ class WatchServiceTest(unittest.TestCase):
         self.assertEqual(result.created, 1)
         self.assertEqual(result.artifacts.get("source"), "deepxiv")
 
+    def test_search_and_import_accepts_deepxiv_result_key(self):
+        zotero = FakeZotero()
+
+        class DeepXivResultFormat:
+            def search(self, query, limit=10):
+                return {
+                    "status": "success",
+                    "total_count": 1,
+                    "result": [
+                        {
+                            "title": "DeepXiv Current Result",
+                            "authors": [{"name": "Evan"}],
+                            "abstract": "DeepXiv current API abstract",
+                            "arxiv_id": "2403.01823",
+                            "date": "2024-03-04T08:16:11Z",
+                        }
+                    ],
+                }
+
+        service = WatchService(zotero=zotero, deepxiv=DeepXivResultFormat(), arxiv=FakeArxiv())
+        result = service.search_and_import(WatchOptions(query="vision language action", dry_run=True))
+        self.assertEqual(result.processed, 1)
+        self.assertEqual(result.created, 1)
+        self.assertEqual(result.artifacts.get("source"), "deepxiv")
+
     def test_search_and_import_real(self):
         zotero = FakeZotero()
         service = WatchService(zotero=zotero, deepxiv=FakeDeepXiv(), arxiv=FakeArxiv())

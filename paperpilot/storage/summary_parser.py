@@ -21,7 +21,7 @@ def extract_structured_fields(
     1.论文基本信息  2.一句话总结  3.研究问题  4.方法概述
     5.技术流程拆解  6.创新点评估  7.技术坐标系定位
     8.实验与结果  9.局限性  10.失败模式  11.综述价值
-    12.分类标签  13.具身智能专用分析  14.潜在研究机会  15.高质量证据片段
+    12.分类标签  13.跨域适配与具身智能启发  14.潜在研究机会  15.高质量证据片段
     """
     sections = _split_sections(markdown)
 
@@ -147,8 +147,8 @@ def extract_summary_facts(
 
 
 def _split_sections(markdown: str) -> dict[str, str]:
-    """Split markdown by `# N.` section headers."""
-    pattern = re.compile(r"^#\s+\d+\.\s+", re.M)
+    """Split markdown by numbered Markdown section headers."""
+    pattern = re.compile(r"^#{1,3}\s+\d+\.\s+", re.M)
     matches = list(pattern.finditer(markdown))
     sections: dict[str, str] = {}
     for i, m in enumerate(matches):
@@ -241,15 +241,92 @@ def _infer_fact_type(line: str, section_no: str) -> str:
     lowered = line.lower()
     if section_no == "15" or "证据" in line or "evidence" in lowered:
         return "evidence"
-    if re.search(r"\d+(?:\.\d+)?\s*(?:%|percent|分|x|×|倍|fps|hz|ms|s|sec|seconds|hours|episodes|steps|trials|tasks|scenes|objects|environments|datasets)?", lowered):
-        return "metric"
-    if any(token in lowered for token in ["dataset", "benchmark", "数据集", "基准"]):
+    if "[启发]" in line:
+        return ""
+    if any(token in line for token in ["原文未包含", "未包含该类实验", "无实证数据集", "无量化指标", "无算法训练"]):
+        return ""
+
+    experiment_sections = {"8", "15"}
+    concrete_sections = experiment_sections | {"12", "13"}
+    numeric = re.search(
+        r"\d+(?:\.\d+)?\s*(?:%|percent|分|x|×|倍|fps|hz|ms|s|sec|seconds|hours|episodes|steps|trials|tasks|scenes|objects|environments|datasets)?",
+        lowered,
+    )
+    metric_tokens = [
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "auc",
+        "success rate",
+        "error",
+        "latency",
+        "throughput",
+        "energy",
+        "performance",
+        "result",
+        "score",
+        "top-1",
+        "top 1",
+        "baseline",
+        "improvement",
+        "指标",
+        "准确率",
+        "精确率",
+        "召回率",
+        "成功率",
+        "错误率",
+        "延迟",
+        "耗时",
+        "能耗",
+        "性能",
+        "结果",
+        "提升",
+        "优于",
+    ]
+
+    dataset_tokens = ["dataset", "corpus", "数据集", "语料库"]
+    dataset_label = re.search(r"(数据集|dataset|benchmark|基准)\s*(?:\*\*)?\s*[：:]", line, re.I)
+    if dataset_label or (section_no in experiment_sections and any(token in lowered for token in dataset_tokens)):
         return "dataset"
-    if any(token in lowered for token in ["baseline", "baselines", "对比方法", "基线"]):
+    if any(token in lowered for token in ["baseline", "baselines", "对比方法", "基线"]) and (
+        section_no in experiment_sections or re.search(r"(baseline|baselines|对比方法|基线)\s*[：:]", line, re.I)
+    ):
         return "baseline"
     if any(token in lowered for token in ["code", "github", "open-source", "开源", "代码"]):
         return "code"
-    if any(token in lowered for token in ["robot", "机器人", "simulator", "simulation", "仿真", "real-world", "真实部署"]):
+    if numeric and (section_no in experiment_sections or any(token in lowered for token in metric_tokens)):
+        return "metric"
+
+    platform_tokens = [
+        "robot",
+        "robotic",
+        "机器人",
+        "simulator",
+        "simulation",
+        "habitat",
+        "hm3d",
+        "mujoco",
+        "isaac",
+        "unity",
+        "ros",
+        "loihi",
+        "gpu",
+        "cpu",
+        "edge device",
+        "real-world",
+        "real robot",
+        "physical deployment",
+        "仿真",
+        "真机",
+        "真实部署",
+        "移动平台",
+        "机械臂",
+        "人形",
+    ]
+    if section_no in concrete_sections and any(token in lowered for token in platform_tokens):
+        if re.search(r"(?:[：:]\s*(?:否|无|不涉及)|not used|not applicable|no real|no robot)", line, re.I):
+            return ""
         return "platform"
     return ""
 

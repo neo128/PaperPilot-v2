@@ -9,6 +9,8 @@ from paperpilot.clients.zotero import ZoteroClient
 from paperpilot.services.summary_service import SummaryOptions, SummaryService
 from paperpilot.storage.paper_summary_store import PaperSummaryStore
 from paperpilot.utils.config import AISettings, load_app_settings
+from paperpilot.utils.env import load_dotenv_if_present, optional_env
+from paperpilot.utils.run_logging import log_stage_result
 
 try:
     from paperpilot.clients.deepxiv import DeepXivClient
@@ -50,18 +52,50 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args(_cli_args())
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_cli_env() -> None:
+    """Load .env from cwd first, then the source checkout root as a fallback."""
+    cwd_env = Path.cwd() / ".env"
+    repo_env = _repo_root() / ".env"
+    load_dotenv_if_present(cwd_env)
+    if repo_env != cwd_env:
+        load_dotenv_if_present(repo_env)
+
+
+def _load_ai_settings(model_override: str | None = None) -> AISettings:
+    _load_cli_env()
+    return AISettings(
+        provider=optional_env("AI_PROVIDER", "openai") or "openai",
+        base_url=optional_env("AI_BASE_URL"),
+        api_key=optional_env("AI_API_KEY") or optional_env("OPENAI_API_KEY"),
+        model=model_override or optional_env("AI_MODEL"),
+    )
+
+
 def main() -> None:
     args = parse_args()
-    settings = load_app_settings()
-    storage_dir = Path(args.storage_dir) if args.storage_dir else (settings.zotero.storage_dir or Path.home() / "Zotero" / "storage")
-
-    zotero = ZoteroClient(settings.zotero.user_id, settings.zotero.api_key)
-    ai_settings = AISettings(
-        provider=settings.ai.provider,
-        base_url=settings.ai.base_url,
-        api_key=settings.ai.api_key,
-        model=args.model or settings.ai.model,
-    )
+    zotero = None
+    if args.pdf_path:
+        ai_settings = _load_ai_settings(args.model)
+        storage_dir = Path(args.storage_dir).expanduser() if args.storage_dir else (
+            Path(optional_env("ZOTERO_STORAGE_DIR")).expanduser() if optional_env("ZOTERO_STORAGE_DIR") else Path.home() / "Zotero" / "storage"
+        )
+    else:
+        env_file = Path.cwd() / ".env"
+        if not env_file.exists():
+            env_file = _repo_root() / ".env"
+        settings = load_app_settings(env_file)
+        storage_dir = Path(args.storage_dir).expanduser() if args.storage_dir else (settings.zotero.storage_dir or Path.home() / "Zotero" / "storage")
+        zotero = ZoteroClient(settings.zotero.user_id, settings.zotero.api_key)
+        ai_settings = AISettings(
+            provider=settings.ai.provider,
+            base_url=settings.ai.base_url,
+            api_key=settings.ai.api_key,
+            model=args.model or settings.ai.model,
+        )
     ai = AIClient(ai_settings)
     deepxiv = DeepXivClient() if args.use_deepxiv else None
     summary_store = PaperSummaryStore(Path(args.summary_db_path).expanduser())
@@ -133,6 +167,7 @@ def main() -> None:
     print(
         f"summary done, processed={result.processed}, created={result.created}, skipped={result.skipped}, failed={result.failed}"
     )
+    log_stage_result(result)
     if result.errors:
         print("errors:")
         for err in result.errors:

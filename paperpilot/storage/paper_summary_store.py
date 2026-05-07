@@ -74,6 +74,22 @@ class PaperSummaryFact:
     created_at: Optional[str] = None
 
 
+@dataclass
+class PaperSummaryFigure:
+    """Local figure/table asset extracted from a source PDF."""
+    paper_id: str
+    zotero_key: str
+    title: Optional[str] = None
+    figure_index: int = 0
+    page: Optional[int] = None
+    file_path: str = ""
+    caption: Optional[str] = None
+    figure_type: Optional[str] = None
+    relevance: Optional[str] = None
+    summary_version: Optional[str] = None
+    created_at: Optional[str] = None
+
+
 class PaperSummaryStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
@@ -161,6 +177,21 @@ class PaperSummaryStore:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(paper_id) REFERENCES paper_summaries(paper_id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS paper_summary_figures (
+                figure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id TEXT NOT NULL,
+                zotero_key TEXT NOT NULL,
+                title TEXT,
+                figure_index INTEGER,
+                page INTEGER,
+                file_path TEXT NOT NULL,
+                caption TEXT,
+                figure_type TEXT,
+                relevance TEXT,
+                summary_version TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(paper_id) REFERENCES paper_summaries(paper_id) ON DELETE CASCADE
+            );
             """)
         # Backward-compat: add columns if table existed before migration.
         for col in [
@@ -197,6 +228,8 @@ class PaperSummaryStore:
             CREATE INDEX IF NOT EXISTS idx_summary_facts_zotero ON paper_summary_facts(zotero_key);
             CREATE INDEX IF NOT EXISTS idx_summary_facts_type ON paper_summary_facts(fact_type);
             CREATE INDEX IF NOT EXISTS idx_summary_facts_label ON paper_summary_facts(label);
+            CREATE INDEX IF NOT EXISTS idx_summary_figures_paper ON paper_summary_figures(paper_id);
+            CREATE INDEX IF NOT EXISTS idx_summary_figures_zotero ON paper_summary_figures(zotero_key);
             CREATE VIRTUAL TABLE IF NOT EXISTS paper_summaries_fts
                 USING fts5(title, one_line_summary, research_problem, method_overview, innovations, experiments,
                            content='paper_summaries', content_rowid='rowid');
@@ -209,7 +242,12 @@ class PaperSummaryStore:
             """)
         self.conn.commit()
 
-    def save(self, summary: PaperSummary, facts: Optional[list[PaperSummaryFact]] = None) -> None:
+    def save(
+        self,
+        summary: PaperSummary,
+        facts: Optional[list[PaperSummaryFact]] = None,
+        figures: Optional[list[PaperSummaryFigure]] = None,
+    ) -> None:
         self.conn.execute(
             """
             INSERT INTO paper_summaries (
@@ -268,6 +306,8 @@ class PaperSummaryStore:
         )
         for fact in facts or []:
             self.save_fact(fact)
+        for figure in figures or []:
+            self.save_figure(figure)
         self.conn.commit()
 
     def save_fact(self, fact: PaperSummaryFact) -> None:
@@ -294,6 +334,29 @@ class PaperSummaryStore:
                 fact.source,
                 fact.summary_version,
                 fact.created_at or utc_now(),
+            ),
+        )
+
+    def save_figure(self, figure: PaperSummaryFigure) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_summary_figures (
+                paper_id, zotero_key, title, figure_index, page, file_path,
+                caption, figure_type, relevance, summary_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                figure.paper_id,
+                figure.zotero_key,
+                figure.title,
+                figure.figure_index,
+                figure.page,
+                figure.file_path,
+                figure.caption,
+                figure.figure_type,
+                figure.relevance,
+                figure.summary_version,
+                figure.created_at or utc_now(),
             ),
         )
 
@@ -400,8 +463,22 @@ class PaperSummaryStore:
         ).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
+    def list_figures(self, paper_id: Optional[str] = None, limit: int = 100) -> list[PaperSummaryFigure]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if paper_id:
+            clauses.append("paper_id = ?")
+            params.append(paper_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM paper_summary_figures{where} ORDER BY paper_id, figure_index LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [self._row_to_figure(row) for row in rows]
+
     def delete(self, paper_id: str) -> bool:
         self.conn.execute("DELETE FROM paper_summary_facts WHERE paper_id = ?", (paper_id,))
+        self.conn.execute("DELETE FROM paper_summary_figures WHERE paper_id = ?", (paper_id,))
         cursor = self.conn.execute("DELETE FROM paper_summaries WHERE paper_id = ?", (paper_id,))
         self.conn.commit()
         return cursor.rowcount > 0
@@ -465,6 +542,22 @@ class PaperSummaryStore:
             confidence=row["confidence"],
             source_section=row["source_section"],
             source=row["source"],
+            summary_version=row["summary_version"],
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _row_to_figure(row: sqlite3.Row) -> PaperSummaryFigure:
+        return PaperSummaryFigure(
+            paper_id=row["paper_id"],
+            zotero_key=row["zotero_key"],
+            title=row["title"],
+            figure_index=row["figure_index"],
+            page=row["page"],
+            file_path=row["file_path"],
+            caption=row["caption"],
+            figure_type=row["figure_type"],
+            relevance=row["relevance"],
             summary_version=row["summary_version"],
             created_at=row["created_at"],
         )

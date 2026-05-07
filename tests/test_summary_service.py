@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from paperpilot.services.summary_service import (
+    ExtractedFigure,
     SummaryOptions,
     SummaryService,
     extract_arxiv_id,
@@ -143,17 +144,35 @@ class SummaryServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pdf_path = Path(tmp) / "test.pdf"
             pdf_path.write_bytes(b"not-a-real-pdf")
-            service = SummaryService(None, FakeAI(), Path(tmp))
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            service = SummaryService(None, FakeAI(), Path(tmp), summary_store=store)
             # patch extract step by monkey patching method target module behavior is overkill, so use a subclass
             service_module = __import__("paperpilot.services.summary_service", fromlist=["extract_pdf_text"])
             old_extract = service_module.extract_pdf_text
             service_module.extract_pdf_text = lambda path, max_pages: "paper text"
+            fig_path = Path(tmp) / "fig_001.png"
+            fig_path.write_bytes(b"fake-png")
+            service._extract_key_figures = lambda path, key, limit: [
+                ExtractedFigure(
+                    file_path=fig_path,
+                    page=1,
+                    caption="Figure 1. System architecture",
+                    figure_type="architecture",
+                )
+            ]
             try:
                 result = service.summarize_local_pdfs([pdf_path], SummaryOptions(), summary_dir=Path(tmp) / "out")
             finally:
                 service_module.extract_pdf_text = old_extract
             self.assertEqual(result.created, 1)
-            self.assertTrue((Path(tmp) / "out" / "test.summary.md").exists())
+            out_md = Path(tmp) / "out" / "test.summary.md"
+            self.assertTrue(out_md.exists())
+            self.assertIn("## 关键图表", out_md.read_text(encoding="utf-8"))
+            self.assertIn("Figure 1. System architecture", out_md.read_text(encoding="utf-8"))
+            figures = store.list_figures()
+            self.assertEqual(len(figures), 1)
+            self.assertEqual(figures[0].caption, "Figure 1. System architecture")
+            store.close()
 
 
 if __name__ == "__main__":

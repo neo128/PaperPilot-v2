@@ -230,7 +230,7 @@ class WatchService:
             try:
                 response = self.deepxiv.search(query, limit=limit)
                 if isinstance(response, dict):
-                    items = response.get("items") or response.get("results") or []
+                    items = response.get("items") or response.get("results") or response.get("result") or []
                 else:
                     items = response
                 if items:

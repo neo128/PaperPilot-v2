@@ -15,7 +15,7 @@ class CapturingAIClient(AIClient):
 
 
 class AIClientPromptTest(unittest.TestCase):
-    def test_chinese_summary_prompt_uses_review_oriented_template(self):
+    def test_chinese_summary_prompt_uses_canonical_template(self):
         ai = CapturingAIClient()
 
         result = ai.summarize_paper_excerpt(
@@ -31,14 +31,18 @@ class AIClientPromptTest(unittest.TestCase):
         system_msg = ai.last_messages[0]["content"]
         prompt = ai.last_messages[1]["content"]
 
-        self.assertIn("科研论文分析助手", system_msg)
+        self.assertIn("科研论文结构化分析助手", system_msg)
+        self.assertIn("canonical AI summary", prompt)
         self.assertIn("所有内容必须标注来源类型：[原文] / [推断] / [启发]", prompt)
         self.assertIn("禁止编造论文中未出现的信息", prompt)
-        self.assertIn("原文片段未提供", prompt)
+        self.assertIn("原文未包含该类实验", prompt)
+        self.assertIn("不要把非实验论文写成片段缺失", prompt)
+        self.assertIn("跨域启发必须统一标 [启发]", prompt)
+        self.assertIn("不能标为 [原文]", prompt)
         self.assertIn("## 1. 论文基本信息", prompt)
         self.assertIn("## 6. 创新点评估", prompt)
-        self.assertIn("## 11. 综述价值", prompt)
-        self.assertIn("## 13. 具身智能专用分析", prompt)
+        self.assertIn("## 11. 通用复用价值", prompt)
+        self.assertIn("## 13. 跨域适配与具身智能启发", prompt)
         self.assertIn("## 15. 高质量证据片段", prompt)
         self.assertIn("论文标题：Robot Paper", prompt)
         self.assertIn("用户提供的论文内容", prompt)

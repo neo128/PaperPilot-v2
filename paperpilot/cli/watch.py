@@ -7,6 +7,7 @@ from paperpilot.clients.deepxiv import DeepXivClient
 from paperpilot.clients.zotero import ZoteroClient
 from paperpilot.services.watch_service import WatchOptions, WatchService
 from paperpilot.utils.config import load_app_settings
+from paperpilot.utils.run_logging import log_stage_result
 
 
 def _cli_args() -> list[str]:
@@ -54,6 +55,7 @@ def main() -> None:
     print(
         f"watch done, processed={result.processed}, created={result.created}, updated={result.updated}, skipped={result.skipped}, failed={result.failed}"
     )
+    log_stage_result(result)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ from paperpilot.services.review_service import (
 from paperpilot.services.watch_service import WatchOptions, WatchService
 from paperpilot.storage.paper_summary_store import PaperSummaryStore
 from paperpilot.utils.config import AISettings, load_app_settings
+from paperpilot.utils.run_logging import log_stage_result, log_stage_results
 
 try:
     from paperpilot.clients.deepxiv import DeepXivClient
@@ -255,6 +256,7 @@ def _collect_zotero_items(
 
 def _print_result(result) -> None:
     print(json.dumps(result.__dict__, ensure_ascii=False, indent=2, default=str))
+    log_stage_result(result)
 
 
 def _summary_store(args: argparse.Namespace) -> PaperSummaryStore:
@@ -512,6 +514,7 @@ def main() -> None:
         results.append(service.draft_review(project, locale=args.locale))
         if run_qc:
             results.append(service.qc_review(project, ReviewQCOptions(draft_path=args.qc_draft_path)))
+        log_stage_results(results)
         print(json.dumps({"success": all(r.failed == 0 for r in results), "stages": [r.__dict__ for r in results]}, ensure_ascii=False, indent=2, default=str))
         summary_store.close()
         return
