@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import datetime as dt
 from datetime import timezone
+import base64
 import hashlib
 import html
 import logging
+import mimetypes
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +16,8 @@ import re
 from pypdf import PdfReader
 
 from paperpilot.clients.ai import AIClient
+from paperpilot.clients.arxiv import ArxivClient
+from paperpilot.clients.open_access import OpenAccessClient
 from paperpilot.clients.zotero import ZoteroClient
 
 try:
@@ -42,7 +46,9 @@ class SummaryOptions:
     mode: str = "general"
     attach_zotero: bool = True
     extract_figures: bool = True
-    figure_limit: int = 5
+    figure_limit: int = 0
+    download_missing_pdfs: bool = False
+    attach_downloaded_pdfs: bool = True
 
 
 @dataclass
@@ -158,6 +164,49 @@ def _figure_type_from_caption(caption: str) -> str:
     return "figure"
 
 
+def _normalized_title_for_match(value: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    return " ".join(text.split())
+
+
+def _titles_match(left: str, right: str) -> bool:
+    left_norm = _normalized_title_for_match(left)
+    right_norm = _normalized_title_for_match(right)
+    if not left_norm or not right_norm:
+        return False
+    return left_norm == right_norm or left_norm in right_norm or right_norm in left_norm
+
+
+def _mime_for_image(path: Path) -> str:
+    return mimetypes.guess_type(path.name)[0] or "image/png"
+
+
+def _image_markdown(figure: ExtractedFigure, index: int, *, embed: bool = False) -> list[str]:
+    caption = figure.caption or f"Candidate figure extracted from page {figure.page}"
+    image_ref = str(figure.file_path)
+    if embed and figure.file_path.exists():
+        encoded = base64.b64encode(figure.file_path.read_bytes()).decode("ascii")
+        image_ref = f"data:{_mime_for_image(figure.file_path)};base64,{encoded}"
+    return [
+        "",
+        f"> **图表 {index}（第 {figure.page} 页，{figure.figure_type}）**：{caption}",
+        f"![图表 {index}]({image_ref})",
+        "",
+    ]
+
+
+def _figure_heading_keywords(figure: ExtractedFigure) -> tuple[str, ...]:
+    figure_type = (figure.figure_type or "").lower()
+    caption = (figure.caption or "").lower()
+    if figure_type in {"architecture", "figure"} and any(token in caption for token in ["architecture", "framework", "pipeline", "overview", "method", "system"]):
+        return ("方法", "技术", "模型", "架构", "路线", "method", "approach", "architecture")
+    if figure_type in {"result", "table"} or any(token in caption for token in ["result", "comparison", "performance", "accuracy", "table"]):
+        return ("实验", "结果", "评估", "性能", "对比", "experiment", "result", "evaluation")
+    if any(token in caption for token in ["dataset", "benchmark", "data"]):
+        return ("数据", "基准", "实验", "dataset", "benchmark")
+    return ("方法", "实验", "结果", "总结", "method", "result")
+
+
 def make_note_html(summary: str) -> str:
     """Convert markdown summary to HTML suitable for Zotero rich-text notes."""
     timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -200,12 +249,23 @@ def extract_arxiv_id(data: dict[str, Any]) -> Optional[str]:
 
 
 class SummaryService:
-    def __init__(self, zotero: Optional[ZoteroClient], ai: AIClient, storage_dir: Path, deepxiv: Optional[DeepXivClient] = None, summary_store: Optional[PaperSummaryStore] = None) -> None:
+    def __init__(
+        self,
+        zotero: Optional[ZoteroClient],
+        ai: AIClient,
+        storage_dir: Path,
+        deepxiv: Optional[DeepXivClient] = None,
+        summary_store: Optional[PaperSummaryStore] = None,
+        open_access: Optional[OpenAccessClient] = None,
+        arxiv: Optional[ArxivClient] = None,
+    ) -> None:
         self.zotero = zotero
         self.ai = ai
         self.storage_dir = storage_dir
         self.deepxiv = deepxiv
         self.summary_store = summary_store
+        self.open_access = open_access
+        self.arxiv = arxiv
 
     def _save_to_store(
         self,
@@ -282,7 +342,62 @@ class SummaryService:
             pdf_hash=pdf_hash,
         )
 
-    def _write_summary_attachment(self, parent_key: str, summary_md: str, *, title: str, mode: str = "general") -> tuple[bool, Optional[str], Optional[str]]:
+    def _cached_by_canonical_key(self, *, canonical_key: str, pdf_hash: Optional[str] = None) -> Optional[PaperSummary]:
+        if not self.summary_store or not canonical_key:
+            return None
+        return self.summary_store.get_valid_canonical(
+            canonical_key=canonical_key,
+            summary_version=AI_SUMMARY_VERSION,
+            pdf_hash=pdf_hash,
+        )
+
+    def _reuse_summary_for_item(
+        self,
+        *,
+        cached: PaperSummary,
+        note_parent_key: str,
+        title: str,
+        options: SummaryOptions,
+        insert_note: bool,
+    ) -> bool:
+        summary_md = cached.full_summary_md or ""
+        if not summary_md:
+            return False
+        if insert_note and options.attach_zotero:
+            self._write_summary_attachment(note_parent_key, summary_md, title=title, mode=options.mode, replace_existing=options.force)
+        logger.info(
+            "summary: reused canonical summary item_key=%s source_zotero_key=%s canonical_key=%s",
+            note_parent_key,
+            cached.zotero_key,
+            cached.canonical_key,
+        )
+        return True
+
+    def _markdown_with_embedded_local_images(self, summary_md: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            alt = match.group("alt")
+            target = match.group("target").strip()
+            if target.startswith(("http://", "https://", "data:", "zotero://")):
+                return match.group(0)
+            image_path = Path(target).expanduser()
+            if not image_path.is_absolute():
+                image_path = Path.cwd() / image_path
+            if not image_path.exists() or not image_path.is_file():
+                return match.group(0)
+            encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            return f"![{alt}](data:{_mime_for_image(image_path)};base64,{encoded})"
+
+        return re.sub(r"!\[(?P<alt>[^\]]*)\]\((?P<target>[^)]+)\)", repl, summary_md)
+
+    def _write_summary_attachment(
+        self,
+        parent_key: str,
+        summary_md: str,
+        *,
+        title: str,
+        mode: str = "general",
+        replace_existing: bool = False,
+    ) -> tuple[bool, Optional[str], Optional[str]]:
         if not self.zotero or not parent_key or not summary_md:
             return False, None, None
         create_file_attachment = getattr(self.zotero, "create_file_attachment", None)
@@ -293,8 +408,28 @@ class SummaryService:
         attachment_dir.mkdir(parents=True, exist_ok=True)
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", title or parent_key).strip("_") or parent_key
         md_path = attachment_dir / f"{stem}_{AI_SUMMARY_VERSION}.md"
-        md_path.write_text(summary_md, encoding="utf-8")
+        attachment_md = self._markdown_with_embedded_local_images(summary_md)
+        md_path.write_text(attachment_md, encoding="utf-8")
         attachment_title = f"PaperPilot {versioned_ai_summary_label('AI总结')} Markdown - {title or parent_key}"
+        try:
+            for child in self.zotero.fetch_children(parent_key):
+                data = child.get("data") or child
+                tags = {str(tag.get("tag") or "") for tag in data.get("tags") or []}
+                if (
+                    str(data.get("filename") or "") == md_path.name
+                    or str(data.get("title") or "") == attachment_title
+                    or f"{versioned_ai_summary_label('AI总结')}-md" in tags
+                ):
+                    existing_key = child.get("key") or data.get("key")
+                    if not replace_existing:
+                        return True, existing_key, attachment_title
+                    delete_item = getattr(self.zotero, "delete_item", None)
+                    version = child.get("version") or data.get("version")
+                    if callable(delete_item) and existing_key and version is not None:
+                        delete_item(existing_key, int(version))
+                    break
+        except Exception:
+            logger.debug("summary: failed to inspect existing Zotero summary attachments", exc_info=True)
         attachment_key = create_file_attachment(
             parent_key,
             md_path,
@@ -309,9 +444,108 @@ class SummaryService:
             return self.summary_store.db_path.parent / "summary-assets"
         return Path(".paperpilot") / "summary-assets"
 
+    def _downloaded_pdf_root(self) -> Path:
+        if self.summary_store is not None:
+            return self.summary_store.db_path.parent / "downloaded-pdfs"
+        return Path(".paperpilot") / "downloaded-pdfs"
+
+    def _downloaded_pdf_destination(self, *, parent_key: str, title: str, metadata: dict[str, Any]) -> Path:
+        canonical_key = canonical_key_from_metadata(metadata, title) or f"zotero:{parent_key}"
+        paper_dir = self._downloaded_pdf_root() / _safe_asset_key(parent_key or canonical_key)
+        filename = f"{_safe_asset_key(title or canonical_key)}.pdf"
+        return paper_dir / filename
+
+    def _summary_metadata(self, data: dict[str, Any], note_parent_key: str) -> dict[str, Any]:
+        if data.get("itemType") != "attachment":
+            return data
+        if not self.zotero or not note_parent_key:
+            return data
+        try:
+            parent = self.zotero.fetch_item(note_parent_key)
+        except Exception:
+            logger.debug("summary: failed to fetch parent metadata for attachment parent_key=%s", note_parent_key, exc_info=True)
+            return data
+        parent_data = parent.get("data") or parent
+        return parent_data if isinstance(parent_data, dict) else data
+
+    def _attach_downloaded_pdf(self, parent_key: str, pdf_path: Path, *, title: str) -> None:
+        if not self.zotero or not parent_key or not pdf_path.exists():
+            return
+        expected_title = f"PaperPilot downloaded PDF - {title or pdf_path.stem}"
+        try:
+            for child in self.zotero.fetch_children(parent_key):
+                data = child.get("data") or child
+                if (
+                    data.get("itemType") == "attachment"
+                    and (
+                        str(data.get("filename") or "") == pdf_path.name
+                        or str(data.get("title") or "") == expected_title
+                    )
+                ):
+                    return
+        except Exception:
+            logger.debug("summary: failed to inspect existing downloaded PDF attachments", exc_info=True)
+        create_file_attachment = getattr(self.zotero, "create_file_attachment", None)
+        if callable(create_file_attachment):
+            create_file_attachment(
+                parent_key,
+                pdf_path,
+                title=expected_title,
+                content_type="application/pdf",
+                tags=["PaperPilot下载PDF", "summary-source:open-access"],
+            )
+
+    def _download_missing_pdf(
+        self,
+        *,
+        parent_key: str,
+        title: str,
+        metadata: dict[str, Any],
+        options: SummaryOptions,
+    ) -> tuple[Optional[Path], str]:
+        if not options.download_missing_pdfs or self.open_access is None:
+            return None, "disabled"
+        destination = self._downloaded_pdf_destination(parent_key=parent_key, title=title, metadata=metadata)
+        if destination.exists():
+            logger.info("summary: using previously downloaded PDF item_key=%s path=%s", parent_key, destination)
+            if options.attach_zotero and options.attach_downloaded_pdfs:
+                self._attach_downloaded_pdf(parent_key, destination, title=title)
+            return destination, "local_download_cache"
+        doi = str(metadata.get("DOI") or metadata.get("doi") or "").strip()
+        arxiv_id = extract_arxiv_id(metadata) or ""
+        if not arxiv_id and not doi and self.arxiv is not None and title:
+            try:
+                candidates = self.arxiv.search(title, limit=5, sort_by="relevance")
+            except Exception as exc:
+                logger.warning("summary: arXiv title lookup failed title=%s error=%s", title, exc)
+                candidates = []
+            for candidate in candidates:
+                candidate_title = str(candidate.get("title") or "")
+                candidate_arxiv_id = str(candidate.get("arxiv_id") or "").strip()
+                if candidate_arxiv_id and _titles_match(title, candidate_title):
+                    arxiv_id = normalize_arxiv_id(candidate_arxiv_id) or candidate_arxiv_id
+                    logger.info(
+                        "summary: resolved missing PDF by arXiv title search item_key=%s arxiv_id=%s title=%s",
+                        parent_key,
+                        arxiv_id,
+                        candidate_title,
+                    )
+                    break
+        lookup = self.open_access.find_pdf(doi=doi, arxiv_id=arxiv_id)
+        if lookup.status != "found" or not lookup.pdf_url:
+            return None, lookup.status or "not_found"
+        downloaded = self.open_access.download_pdf(lookup.pdf_url, destination, force=options.force)
+        if options.attach_zotero and options.attach_downloaded_pdfs:
+            self._attach_downloaded_pdf(parent_key, downloaded, title=title)
+        logger.info(
+            "summary: downloaded missing PDF item_key=%s source=%s path=%s",
+            parent_key,
+            lookup.source,
+            downloaded,
+        )
+        return downloaded, lookup.source or "open_access"
+
     def _extract_key_figures(self, pdf_path: Path, canonical_key: str, limit: int) -> list[ExtractedFigure]:
-        if limit <= 0:
-            return []
         try:
             reader = PdfReader(str(pdf_path))
         except Exception:
@@ -320,7 +554,7 @@ class SummaryService:
         asset_dir.mkdir(parents=True, exist_ok=True)
         figures: list[ExtractedFigure] = []
         for page_index, page in enumerate(reader.pages, start=1):
-            if len(figures) >= limit:
+            if limit > 0 and len(figures) >= limit:
                 break
             try:
                 page_text = page.extract_text() or ""
@@ -332,7 +566,7 @@ class SummaryService:
             except Exception:
                 continue
             for image_index, image in enumerate(images, start=1):
-                if len(figures) >= limit:
+                if limit > 0 and len(figures) >= limit:
                     break
                 name = getattr(image, "name", "") or f"image_{image_index}.png"
                 suffix = Path(name).suffix.lower()
@@ -342,6 +576,9 @@ class SummaryService:
                 try:
                     pil_image = getattr(image, "image", None)
                     if pil_image is not None:
+                        width, height = getattr(pil_image, "size", (0, 0))
+                        if width < 160 or height < 120 or width * height < 30000:
+                            continue
                         pil_image.save(out_path)
                     else:
                         data = getattr(image, "data", b"")
@@ -364,19 +601,39 @@ class SummaryService:
     def _inject_figures_section(self, summary_md: str, figures: list[ExtractedFigure]) -> str:
         if not figures:
             return summary_md
-        lines = ["", "## 关键图表", ""]
-        for index, figure in enumerate(figures, start=1):
-            caption = figure.caption or f"Candidate figure extracted from page {figure.page}"
-            lines.extend(
-                [
-                    f"### Figure {index}. {caption}",
-                    f"![Figure {index}]({figure.file_path})",
-                    f"- 页码：{figure.page}",
-                    f"- 类型：{figure.figure_type}",
-                    "",
-                ]
-            )
-        return summary_md.rstrip() + "\n" + "\n".join(lines).rstrip() + "\n"
+        lines = summary_md.rstrip().splitlines()
+        insertions: dict[int, list[str]] = {}
+        deferred: list[tuple[int, ExtractedFigure]] = []
+        heading_indexes = [
+            (idx, line)
+            for idx, line in enumerate(lines)
+            if re.match(r"^#{1,4}\s+", line.strip())
+        ]
+
+        for figure_index, figure in enumerate(figures, start=1):
+            keywords = _figure_heading_keywords(figure)
+            target_index: Optional[int] = None
+            for idx, heading in heading_indexes:
+                lowered = heading.lower()
+                if any(keyword.lower() in lowered for keyword in keywords):
+                    target_index = idx + 1
+                    break
+            if target_index is None:
+                deferred.append((figure_index, figure))
+            else:
+                insertions.setdefault(target_index, []).extend(_image_markdown(figure, figure_index))
+
+        out: list[str] = []
+        for idx, line in enumerate(lines):
+            out.append(line)
+            if idx + 1 in insertions:
+                out.extend(insertions[idx + 1])
+
+        if deferred:
+            out.extend(["", "## 图表补充"])
+            for figure_index, figure in deferred:
+                out.extend(_image_markdown(figure, figure_index))
+        return "\n".join(out).rstrip() + "\n"
 
     def summarize_text(
         self,
@@ -422,7 +679,13 @@ class SummaryService:
             figures=figures,
         )
         if insert_attachment and options.attach_zotero:
-            ok, attachment_key, attachment_title = self._write_summary_attachment(zotero_key, summary, title=title, mode=options.mode)
+            ok, attachment_key, attachment_title = self._write_summary_attachment(
+                zotero_key,
+                summary,
+                title=title,
+                mode=options.mode,
+                replace_existing=options.force,
+            )
             if paper_id and self.summary_store:
                 self.summary_store.update_attachment_status(
                     paper_id,
@@ -530,6 +793,8 @@ class SummaryService:
         started = time.monotonic()
         result = StageResult(stage="summary")
         logger.info("summary: starting Zotero item summaries count=%d insert_note=%s", len(items), insert_note)
+        seen_parent_keys: set[str] = set()
+        regenerated_canonical_keys: set[str] = set()
         for entry in items:
             data = entry.get("data", entry)
             result.processed += 1
@@ -537,7 +802,14 @@ class SummaryService:
             logger.info("summary: processing item key=%s title=%s", data.get("key"), title)
             parent_key = data.get("key")
             note_parent_key = data.get("parentItem") or parent_key
-            canonical_key = canonical_key_from_metadata(data, title)
+            if note_parent_key in seen_parent_keys:
+                result.skipped += 1
+                logger.info("summary: duplicate parent in input, skipping item key=%s parent_key=%s", data.get("key"), note_parent_key)
+                continue
+            seen_parent_keys.add(note_parent_key)
+            metadata = self._summary_metadata(data, note_parent_key)
+            title = metadata.get("title") or metadata.get("shortTitle") or title
+            canonical_key = canonical_key_from_metadata(metadata, title)
 
             if self.zotero and not options.force and has_existing_ai_summary(self.zotero, note_parent_key, options.note_tag):
                 result.skipped += 1
@@ -545,9 +817,21 @@ class SummaryService:
                 continue
 
             created_for_item = False
+            can_reuse_before_read = (not options.force) or (canonical_key in regenerated_canonical_keys)
+            if can_reuse_before_read:
+                cached_by_key = self._cached_by_canonical_key(canonical_key=canonical_key)
+                if cached_by_key and self._reuse_summary_for_item(
+                    cached=cached_by_key,
+                    note_parent_key=note_parent_key,
+                    title=title,
+                    options=options,
+                    insert_note=insert_note,
+                ):
+                    result.skipped += 1
+                    continue
 
             if options.use_deepxiv and self.deepxiv is not None:
-                arxiv_id = extract_arxiv_id(data)
+                arxiv_id = extract_arxiv_id(metadata)
                 if arxiv_id:
                     deepxiv_text = self._build_deepxiv_context(arxiv_id, options.deepxiv_sections)
                     if deepxiv_text:
@@ -570,7 +854,13 @@ class SummaryService:
                             source_priority=20,
                         )
                         if insert_note and options.attach_zotero:
-                            ok, attachment_key, attachment_title = self._write_summary_attachment(note_parent_key, summary, title=title, mode=options.mode)
+                            ok, attachment_key, attachment_title = self._write_summary_attachment(
+                                note_parent_key,
+                                summary,
+                                title=title,
+                                mode=options.mode,
+                                replace_existing=options.force,
+                            )
                             if paper_id and self.summary_store:
                                 self.summary_store.update_attachment_status(
                                     paper_id,
@@ -580,6 +870,8 @@ class SummaryService:
                                 )
                         result.created += 1
                         created_for_item = True
+                        if canonical_key:
+                            regenerated_canonical_keys.add(canonical_key)
 
             if created_for_item:
                 continue
@@ -596,8 +888,30 @@ class SummaryService:
                 pdfs = find_pdf_attachments(children)
 
             if not pdfs:
-                abstract_text = (data.get("abstractNote") or data.get("abstract") or "").strip()
+                downloaded_pdf, download_status = self._download_missing_pdf(
+                    parent_key=note_parent_key,
+                    title=title,
+                    metadata=metadata,
+                    options=options,
+                )
+                if downloaded_pdf is not None:
+                    pdfs = [{"key": note_parent_key, "filename": downloaded_pdf.name, "path": str(downloaded_pdf), "itemType": "attachment", "contentType": "application/pdf", "linkMode": "linked_file"}]
+                elif download_status not in {"disabled", "missing_identifier"}:
+                    result.errors.append(f"PDF download unavailable for {note_parent_key}: {download_status}")
+
+            if not pdfs:
+                abstract_text = (metadata.get("abstractNote") or metadata.get("abstract") or "").strip()
                 if abstract_text:
+                    cached_by_key = self._cached_by_canonical_key(canonical_key=canonical_key) if can_reuse_before_read else None
+                    if cached_by_key and self._reuse_summary_for_item(
+                        cached=cached_by_key,
+                        note_parent_key=note_parent_key,
+                        title=title,
+                        options=options,
+                        insert_note=insert_note,
+                    ):
+                        result.skipped += 1
+                        continue
                     logger.info("summary: using abstract fallback item key=%s", note_parent_key)
                     summary = self.ai.summarize_paper_excerpt(
                         title=title,
@@ -618,7 +932,13 @@ class SummaryService:
                         source_priority=10,
                     )
                     if insert_note and options.attach_zotero:
-                        ok, attachment_key, attachment_title = self._write_summary_attachment(note_parent_key, summary, title=title, mode=options.mode)
+                        ok, attachment_key, attachment_title = self._write_summary_attachment(
+                            note_parent_key,
+                            summary,
+                            title=title,
+                            mode=options.mode,
+                            replace_existing=options.force,
+                        )
                         if paper_id and self.summary_store:
                             self.summary_store.update_attachment_status(
                                 paper_id,
@@ -627,6 +947,8 @@ class SummaryService:
                                 status="uploaded" if ok else "failed",
                             )
                     result.created += 1
+                    if canonical_key:
+                        regenerated_canonical_keys.add(canonical_key)
                     continue
                 result.skipped += 1
                 logger.info("summary: no PDF or abstract, skipping item key=%s", note_parent_key)
@@ -635,9 +957,23 @@ class SummaryService:
             for attachment in pdfs:
                 pdf_path = resolve_pdf_path(self.storage_dir, attachment)
                 if not pdf_path.exists():
-                    result.errors.append(f"Missing PDF: {pdf_path}")
-                    logger.error("summary: missing Zotero PDF path=%s item_key=%s", pdf_path, note_parent_key)
-                    continue
+                    logger.warning("summary: missing Zotero PDF path=%s item_key=%s; trying open-access download", pdf_path, note_parent_key)
+                    downloaded_pdf, download_status = self._download_missing_pdf(
+                        parent_key=note_parent_key,
+                        title=title,
+                        metadata=metadata,
+                        options=options,
+                    )
+                    if downloaded_pdf is None:
+                        result.errors.append(f"Missing PDF: {pdf_path}; download_status={download_status}")
+                        logger.error(
+                            "summary: missing Zotero PDF and download failed path=%s item_key=%s status=%s",
+                            pdf_path,
+                            note_parent_key,
+                            download_status,
+                        )
+                        continue
+                    pdf_path = downloaded_pdf
                 pdf_hash = file_sha256(pdf_path)
                 cached = self._cached_canonical(
                     zotero_key=note_parent_key,
@@ -645,7 +981,16 @@ class SummaryService:
                     pdf_hash=pdf_hash,
                     options=options,
                 )
+                if not cached and can_reuse_before_read:
+                    cached = self._cached_by_canonical_key(canonical_key=canonical_key, pdf_hash=pdf_hash)
                 if cached and cached.full_summary_md:
+                    self._reuse_summary_for_item(
+                        cached=cached,
+                        note_parent_key=note_parent_key,
+                        title=title,
+                        options=options,
+                        insert_note=insert_note,
+                    )
                     result.skipped += 1
                     created_for_item = True
                     logger.info("summary: using cached canonical summary item_key=%s", note_parent_key)
@@ -667,6 +1012,8 @@ class SummaryService:
                     insert_attachment=insert_note,
                 )
                 result.created += 1
+                if canonical_key:
+                    regenerated_canonical_keys.add(canonical_key)
                 created_for_item = True
             if not created_for_item:
                 result.failed += 1

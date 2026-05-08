@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from pathlib import Path
 
 from paperpilot.clients.ai import AIClient
+from paperpilot.clients.arxiv import ArxivClient
+from paperpilot.clients.open_access import OpenAccessClient
 from paperpilot.clients.zotero import ZoteroClient
 from paperpilot.models.results import StageResult
 from paperpilot.services.summary_service import SummaryOptions, SummaryService
@@ -68,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-summary", action="store_true", help="Regenerate canonical AI summaries even when cached.")
     parser.add_argument("--mode", choices=["general", "brief"], default="general", help="AI summary profile for standalone summaries.")
     parser.add_argument("--no-zotero-attachment", action="store_true", help="Do not upload generated Markdown summaries as Zotero attachments.")
+    parser.add_argument("--figure-limit", type=int, default=0, help="Maximum extracted figures to insert; 0 means no fixed count limit.")
+    parser.add_argument("--no-extract-figures", action="store_true", help="Do not extract and insert PDF figures into generated summaries.")
+    parser.add_argument("--download-missing-pdfs", action="store_true", default=True, help="Download open-access PDFs when Zotero PDF attachments are missing or broken.")
+    parser.add_argument("--no-download-missing-pdfs", dest="download_missing_pdfs", action="store_false", help="Do not download missing PDFs; fall back to abstracts when available.")
+    parser.add_argument("--no-attach-downloaded-pdfs", action="store_true", help="Download PDFs locally but do not upload them back to Zotero.")
+    parser.add_argument("--unpaywall-email", help="Email for Unpaywall DOI lookup. Defaults to UNPAYWALL_EMAIL.")
     parser.add_argument("--locale", default="zh")
     parser.add_argument("--model", help="Override AI model.")
     parser.add_argument("--use-deepxiv", action="store_true", help="Use DeepXiv as the preferred structured paper source before PDF fallback.")
@@ -222,7 +231,17 @@ def main() -> None:
     ai = AIClient(ai_settings)
     deepxiv = DeepXivClient() if args.use_deepxiv else None
     summary_store = PaperSummaryStore(Path(args.summary_db_path).expanduser())
-    service = SummaryService(zotero, ai, storage_dir, deepxiv=deepxiv, summary_store=summary_store)
+    open_access = OpenAccessClient(email=args.unpaywall_email or os.environ.get("UNPAYWALL_EMAIL")) if args.download_missing_pdfs else None
+    arxiv = ArxivClient(timeout=30) if args.download_missing_pdfs else None
+    service = SummaryService(
+        zotero,
+        ai,
+        storage_dir,
+        deepxiv=deepxiv,
+        summary_store=summary_store,
+        open_access=open_access,
+        arxiv=arxiv,
+    )
 
     if args.pdf_path:
         pdf_paths = [Path(p).expanduser() for p in args.pdf_path]
@@ -237,6 +256,9 @@ def main() -> None:
                 use_deepxiv=args.use_deepxiv,
                 mode=args.mode,
                 attach_zotero=not args.no_zotero_attachment,
+                extract_figures=not args.no_extract_figures,
+                figure_limit=args.figure_limit,
+                download_missing_pdfs=False,
             ),
             summary_dir=Path(args.summary_dir).expanduser() if args.summary_dir else None,
         )
@@ -269,24 +291,28 @@ def main() -> None:
                                 stack.append(child["key"])
             if collection_keys:
                 for key in collection_keys:
-                    items.extend(list(zotero.iter_items(collection=key, tag=args.tag, limit=args.limit, top_only=False)))
+                    items.extend(list(zotero.iter_items(collection=key, tag=args.tag, limit=args.limit, top_only=True)))
             else:
-                items = list(zotero.iter_items(collection=None, tag=args.tag, limit=args.limit, top_only=False))
+                items = list(zotero.iter_items(collection=None, tag=args.tag, limit=args.limit, top_only=True))
 
         result = service.summarize_items(
-        items,
-        SummaryOptions(
-            max_pages=args.max_pages,
-            max_chars=args.max_chars,
-            note_tag=args.note_tag,
-            force=args.force or args.force_summary,
-            locale=args.locale,
-            use_deepxiv=args.use_deepxiv,
-            mode=args.mode,
-            attach_zotero=not args.no_zotero_attachment,
-        ),
-        insert_note=(args.insert_note or not args.pdf_path) and not args.no_zotero_attachment,
-    )
+            items,
+            SummaryOptions(
+                max_pages=args.max_pages,
+                max_chars=args.max_chars,
+                note_tag=args.note_tag,
+                force=args.force or args.force_summary,
+                locale=args.locale,
+                use_deepxiv=args.use_deepxiv,
+                mode=args.mode,
+                attach_zotero=not args.no_zotero_attachment,
+                extract_figures=not args.no_extract_figures,
+                figure_limit=args.figure_limit,
+                download_missing_pdfs=args.download_missing_pdfs,
+                attach_downloaded_pdfs=not args.no_attach_downloaded_pdfs,
+            ),
+            insert_note=(args.insert_note or not args.pdf_path) and not args.no_zotero_attachment,
+        )
     print(
         f"summary done, processed={result.processed}, created={result.created}, skipped={result.skipped}, failed={result.failed}"
     )

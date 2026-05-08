@@ -19,9 +19,13 @@ class FakeZotero:
     def __init__(self):
         self.notes = []
         self.attachments = []
+        self.children = []
 
     def fetch_children(self, parent_key):
-        return []
+        return self.children
+
+    def fetch_item(self, item_key):
+        return {"data": {"key": item_key, "title": "Paper", "itemType": "journalArticle", "url": "https://arxiv.org/abs/2409.05591"}}
 
     def create_note(self, parent_key, note_html, tags=None):
         self.notes.append((parent_key, note_html, tags))
@@ -32,7 +36,11 @@ class FakeZotero:
 
 
 class FakeAI:
+    def __init__(self):
+        self.calls = []
+
     def summarize_paper_excerpt(self, **kwargs):
+        self.calls.append(kwargs)
         return """# 1. 论文基本信息
 
 - 标题：Paper
@@ -43,6 +51,10 @@ class FakeAI:
 ## 原文明确内容
 
 This is a test summary.
+
+# 3. 方法与架构
+
+The method uses a compact architecture.
 
 # 8. 实验与结果
 
@@ -59,6 +71,45 @@ class FakeDeepXiv:
 
     def section(self, arxiv_id, section):
         return f"{section} content"
+
+
+class FakeOpenAccess:
+    def __init__(self):
+        self.lookups = []
+        self.downloads = []
+
+    def find_pdf(self, *, doi="", arxiv_id=""):
+        self.lookups.append((doi, arxiv_id))
+        return type(
+            "Lookup",
+            (),
+            {
+                "status": "found",
+                "source": "arxiv",
+                "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}.pdf",
+            },
+        )()
+
+    def download_pdf(self, pdf_url, destination, *, force=False):
+        self.downloads.append((pdf_url, destination, force))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"not-a-real-pdf")
+        return destination
+
+
+class FakeArxiv:
+    def __init__(self):
+        self.searches = []
+
+    def search(self, query, limit=10, sort_by="submittedDate"):
+        self.searches.append((query, limit, sort_by))
+        return [
+            {
+                "title": query,
+                "arxiv_id": "2604.12345v1",
+                "src_url": "https://arxiv.org/pdf/2604.12345v1.pdf",
+            }
+        ]
 
 
 class SummaryServiceHelpersTest(unittest.TestCase):
@@ -114,6 +165,43 @@ class SummaryServiceTest(unittest.TestCase):
         self.assertEqual(zotero.attachments[0][3], "text/markdown")
         self.assertIn("AI总结-v2-md", zotero.attachments[0][4])
 
+    def test_summary_attachment_skips_existing_markdown_attachment(self):
+        zotero = FakeZotero()
+        zotero.children = [
+            {
+                "key": "EXISTING",
+                "data": {
+                    "itemType": "attachment",
+                    "title": "PaperPilot AI总结-v2 Markdown - Paper",
+                    "filename": "Paper_v2.md",
+                    "tags": [{"tag": "AI总结-v2-md"}],
+                },
+            }
+        ]
+        service = SummaryService(zotero, FakeAI(), Path("/tmp"))
+
+        ok, attachment_key, _ = service._write_summary_attachment("ITEMA", "# Summary", title="Paper")
+
+        self.assertTrue(ok)
+        self.assertEqual(attachment_key, "EXISTING")
+        self.assertEqual(zotero.attachments, [])
+
+    def test_summary_attachment_embeds_local_images_for_zotero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zotero = FakeZotero()
+            service = SummaryService(zotero, FakeAI(), Path(tmp))
+            image_path = Path(tmp) / "figure.png"
+            image_path.write_bytes(b"fake-image")
+
+            ok, attachment_key, _ = service._write_summary_attachment("ITEMA", f"![Fig]({image_path})", title="Paper")
+
+            self.assertTrue(ok)
+            self.assertEqual(attachment_key, "ATTACH1")
+            md_path = Path(zotero.attachments[0][2])
+            md = md_path.read_text(encoding="utf-8")
+            self.assertIn("data:image/png;base64,", md)
+            self.assertNotIn(str(image_path), md)
+
     def test_summary_writes_sqlite_record_and_facts(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
@@ -131,6 +219,46 @@ class SummaryServiceTest(unittest.TestCase):
             self.assertEqual(summary.summary_profile, "general")
             store.close()
 
+    def test_reuses_canonical_summary_for_duplicate_paper_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            zotero = FakeZotero()
+            ai = FakeAI()
+            service = SummaryService(zotero, ai, Path(tmp), summary_store=store)
+            items = [
+                {"data": {"key": "ITEMA", "title": "Same Paper", "itemType": "journalArticle", "abstractNote": "Abstract A"}},
+                {"data": {"key": "ITEMB", "title": "Same Paper", "itemType": "journalArticle", "abstractNote": "Abstract B"}},
+            ]
+
+            result = service.summarize_items(items, SummaryOptions(), insert_note=True)
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(result.skipped, 1)
+            self.assertEqual(result.failed, 0)
+            self.assertEqual(len(ai.calls), 1)
+            self.assertEqual(len(zotero.attachments), 2)
+            store.close()
+
+    def test_force_summary_regenerates_duplicate_canonical_only_once_per_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            zotero = FakeZotero()
+            ai = FakeAI()
+            service = SummaryService(zotero, ai, Path(tmp), summary_store=store)
+            items = [
+                {"data": {"key": "ITEMA", "title": "Same Paper", "itemType": "journalArticle", "abstractNote": "Abstract A"}},
+                {"data": {"key": "ITEMB", "title": "Same Paper", "itemType": "journalArticle", "abstractNote": "Abstract B"}},
+            ]
+
+            result = service.summarize_items(items, SummaryOptions(force=True), insert_note=True)
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(result.skipped, 1)
+            self.assertEqual(result.failed, 0)
+            self.assertEqual(len(ai.calls), 1)
+            self.assertEqual(len(zotero.attachments), 2)
+            store.close()
+
     def test_use_deepxiv_before_pdf_fallback(self):
         zotero = FakeZotero()
         service = SummaryService(zotero, FakeAI(), Path("/tmp"), deepxiv=FakeDeepXiv())
@@ -139,6 +267,87 @@ class SummaryServiceTest(unittest.TestCase):
         self.assertEqual(result.created, 1)
         self.assertEqual(zotero.notes, [])
         self.assertEqual(len(zotero.attachments), 1)
+
+    def test_downloads_missing_zotero_pdf_before_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zotero = FakeZotero()
+            zotero.children = [
+                {
+                    "data": {
+                        "key": "PDF1",
+                        "itemType": "attachment",
+                        "filename": "missing.pdf",
+                        "contentType": "application/pdf",
+                        "linkMode": "linked_file",
+                        "path": str(Path(tmp) / "missing.pdf"),
+                    }
+                }
+            ]
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            oa = FakeOpenAccess()
+            service = SummaryService(zotero, FakeAI(), Path(tmp), summary_store=store, open_access=oa)
+            service_module = __import__("paperpilot.services.summary_service", fromlist=["extract_pdf_text", "file_sha256"])
+            old_extract = service_module.extract_pdf_text
+            old_hash = service_module.file_sha256
+            service_module.extract_pdf_text = lambda path, max_pages: "paper text"
+            service_module.file_sha256 = lambda path: "hash"
+            try:
+                result = service.summarize_items(
+                    [{"data": {"key": "ITEMA", "title": "Paper", "itemType": "journalArticle", "url": "https://arxiv.org/abs/2409.05591"}}],
+                    SummaryOptions(download_missing_pdfs=True),
+                    insert_note=True,
+                )
+            finally:
+                service_module.extract_pdf_text = old_extract
+                service_module.file_sha256 = old_hash
+                store.close()
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(result.failed, 0)
+            self.assertEqual(oa.lookups, [("", "2409.05591")])
+            self.assertEqual(len(oa.downloads), 1)
+            self.assertGreaterEqual(len(zotero.attachments), 2)
+            self.assertIn("application/pdf", [attachment[3] for attachment in zotero.attachments])
+
+    def test_downloads_missing_pdf_by_title_search_when_identifier_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zotero = FakeZotero()
+            zotero.children = [
+                {
+                    "data": {
+                        "key": "PDF1",
+                        "itemType": "attachment",
+                        "filename": "missing.pdf",
+                        "contentType": "application/pdf",
+                        "linkMode": "linked_file",
+                        "path": str(Path(tmp) / "missing.pdf"),
+                    }
+                }
+            ]
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            oa = FakeOpenAccess()
+            arxiv = FakeArxiv()
+            service = SummaryService(zotero, FakeAI(), Path(tmp), summary_store=store, open_access=oa, arxiv=arxiv)
+            service_module = __import__("paperpilot.services.summary_service", fromlist=["extract_pdf_text", "file_sha256"])
+            old_extract = service_module.extract_pdf_text
+            old_hash = service_module.file_sha256
+            service_module.extract_pdf_text = lambda path, max_pages: "paper text"
+            service_module.file_sha256 = lambda path: "hash"
+            try:
+                result = service.summarize_items(
+                    [{"data": {"key": "ITEMA", "title": "Residual Context Diffusion Language Models", "itemType": "journalArticle"}}],
+                    SummaryOptions(download_missing_pdfs=True),
+                    insert_note=False,
+                )
+            finally:
+                service_module.extract_pdf_text = old_extract
+                service_module.file_sha256 = old_hash
+                store.close()
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(result.failed, 0)
+            self.assertEqual(arxiv.searches[0][0], "Residual Context Diffusion Language Models")
+            self.assertEqual(oa.lookups, [("", "2604.12345")])
 
     def test_summarize_local_pdfs_to_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,8 +376,11 @@ class SummaryServiceTest(unittest.TestCase):
             self.assertEqual(result.created, 1)
             out_md = Path(tmp) / "out" / "test.summary.md"
             self.assertTrue(out_md.exists())
-            self.assertIn("## 关键图表", out_md.read_text(encoding="utf-8"))
-            self.assertIn("Figure 1. System architecture", out_md.read_text(encoding="utf-8"))
+            summary_md = out_md.read_text(encoding="utf-8")
+            self.assertNotIn("## 关键图表", summary_md)
+            self.assertIn("**图表 1（第 1 页，architecture）**", summary_md)
+            self.assertIn("Figure 1. System architecture", summary_md)
+            self.assertLess(summary_md.index("**图表 1"), summary_md.index("The method uses a compact architecture."))
             figures = store.list_figures()
             self.assertEqual(len(figures), 1)
             self.assertEqual(figures[0].caption, "Figure 1. System architecture")
