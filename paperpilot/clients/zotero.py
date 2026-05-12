@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -85,15 +87,26 @@ class ZoteroClient:
         use_env_proxy: bool = True,
         user_agent: str = "PaperPilot-v2/0.1",
         timeout: int = 8,
+        local_storage_dir: Optional[Path] = None,
     ) -> None:
         self.base = f"https://api.zotero.org/users/{user_id}"
         self.timeout = timeout
         self._search_unavailable_until = 0.0
         self._proxy_disabled = not use_env_proxy
+        self.local_storage_dir = self._resolve_local_storage_dir(local_storage_dir)
         self.session = create_session(
             headers={"Zotero-API-Key": api_key, "User-Agent": user_agent},
             use_env_proxy=use_env_proxy,
         )
+
+    def _resolve_local_storage_dir(self, local_storage_dir: Optional[Path]) -> Optional[Path]:
+        if local_storage_dir is not None:
+            return Path(local_storage_dir).expanduser()
+        env_storage = os.environ.get("ZOTERO_STORAGE_DIR")
+        if env_storage:
+            return Path(env_storage).expanduser()
+        default_storage = Path.home() / "Zotero" / "storage"
+        return default_storage if default_storage.exists() else None
 
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         try:
@@ -279,7 +292,6 @@ class ZoteroClient:
         tags: Optional[List[str]] = None,
     ) -> Optional[str]:
         path = Path(file_path)
-        data = path.read_bytes()
         filename = path.name
         mime = content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
         attachment_keys = self.create_items([
@@ -301,6 +313,27 @@ class ZoteroClient:
         if not attachment_keys:
             return None
         attachment_key = attachment_keys[0]
+        self.upload_file_to_attachment(attachment_key, path, content_type=mime, previous_md5="")
+        return attachment_key
+
+    def upload_file_to_attachment(
+        self,
+        attachment_key: str,
+        file_path: str | Path,
+        *,
+        content_type: Optional[str] = None,
+        previous_md5: Optional[str] = None,
+    ) -> None:
+        """Upload bytes to an existing imported-file attachment and mirror locally."""
+        path = Path(file_path)
+        data = path.read_bytes()
+        filename = path.name
+        mime = content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if previous_md5 is None:
+            entry = self.fetch_item(attachment_key)
+            entry_data = _entry_data(entry)
+            previous_md5 = str(entry_data.get("md5") or "").strip()
+        precondition_headers = {"If-Match": previous_md5} if previous_md5 else {"If-None-Match": "*"}
         md5 = hashlib.md5(data).hexdigest()
         mtime_ms = int(path.stat().st_mtime * 1000)
         auth = self._request(
@@ -312,10 +345,11 @@ class ZoteroClient:
                 "filesize": str(len(data)),
                 "mtime": str(mtime_ms),
             },
-            headers={"If-None-Match": "*"},
+            headers=precondition_headers,
         ).json()
         if auth.get("exists"):
-            return attachment_key
+            self._mirror_file_to_local_storage(attachment_key, path)
+            return
 
         upload_body = auth.get("prefix", "").encode("utf-8") + data + auth.get("suffix", "").encode("utf-8")
         upload_response = self._upload_file_with_retry(
@@ -328,9 +362,20 @@ class ZoteroClient:
             "post",
             f"{self.base}/items/{attachment_key}/file",
             data={"upload": auth["uploadKey"]},
-            headers={"If-None-Match": "*"},
+            headers=precondition_headers,
         )
-        return attachment_key
+        self._mirror_file_to_local_storage(attachment_key, path)
+
+    def _mirror_file_to_local_storage(self, attachment_key: str, path: Path) -> None:
+        """Make API-created imported files immediately openable in local Zotero."""
+        if not self.local_storage_dir:
+            return
+        try:
+            target_dir = self.local_storage_dir / attachment_key
+            target_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target_dir / path.name)
+        except OSError:
+            return
 
     def _upload_file_with_retry(self, url: str, body: bytes, *, content_type: str) -> requests.Response:
         last_exc: Optional[Exception] = None

@@ -68,7 +68,6 @@ class ZoteroClientHelpersTest(unittest.TestCase):
         self.assertEqual(calls.count(1), 3)
 
     def test_create_file_attachment_uploads_and_registers(self):
-        client = ZoteroClient("1", "key")
         calls = []
 
         def fake_request(method, url, **kwargs):
@@ -91,19 +90,101 @@ class ZoteroClientHelpersTest(unittest.TestCase):
                 return response
             raise AssertionError(url)
 
-        client._request = fake_request
-        with tempfile.TemporaryDirectory() as tmp, patch.object(client, "_upload_file_with_retry") as upload:
-            upload.return_value.raise_for_status.return_value = None
-            path = Path(tmp) / "summary.html"
-            path.write_text("<p>summary</p>", encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            client = ZoteroClient("1", "key", local_storage_dir=Path(tmp) / "zotero-storage")
+            client._request = fake_request
+            storage_dir = client.local_storage_dir
+            assert storage_dir is not None
+            with patch.object(client, "_upload_file_with_retry") as upload:
+                upload.return_value.raise_for_status.return_value = None
+                path = Path(tmp) / "summary.html"
+                path.write_text("<p>summary</p>", encoding="utf-8")
 
-            key = client.create_file_attachment("PARENT1", path, title="Summary", content_type="text/html", tags=["AI精读附件"])
+                key = client.create_file_attachment("PARENT1", path, title="Summary", content_type="text/html", tags=["AI精读附件"])
 
-        self.assertEqual(key, "ATTACH1")
-        self.assertEqual(calls[0][2]["json"][0]["linkMode"], "imported_file")
-        self.assertEqual(calls[0][2]["json"][0]["parentItem"], "PARENT1")
-        self.assertEqual(calls[-1][2]["data"], {"upload": "UPLOAD1"})
-        self.assertIn(b"<p>summary</p>", upload.call_args.args[1])
+                self.assertEqual(key, "ATTACH1")
+                self.assertEqual(calls[0][2]["json"][0]["linkMode"], "imported_file")
+                self.assertEqual(calls[0][2]["json"][0]["parentItem"], "PARENT1")
+                self.assertEqual(calls[-1][2]["data"], {"upload": "UPLOAD1"})
+                self.assertIn(b"<p>summary</p>", upload.call_args.args[1])
+                self.assertEqual((storage_dir / "ATTACH1" / "summary.html").read_text(encoding="utf-8"), "<p>summary</p>")
+
+    def test_create_file_attachment_mirrors_existing_remote_file_to_local_storage(self):
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith("/items") and method == "post":
+                return FakeResponse(["ATTACH2"])
+            if url.endswith("/items/ATTACH2/file"):
+                response = MagicMock()
+                response.json.return_value = {"exists": True}
+                return response
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = ZoteroClient("1", "key", local_storage_dir=Path(tmp) / "zotero-storage")
+            client._request = fake_request
+            storage_dir = client.local_storage_dir
+            assert storage_dir is not None
+            path = Path(tmp) / "summary.md"
+            path.write_text("# summary", encoding="utf-8")
+
+            key = client.create_file_attachment("PARENT1", path, title="Summary", content_type="text/markdown")
+
+            self.assertEqual(key, "ATTACH2")
+            self.assertEqual(len([call for call in calls if call[1].endswith("/items/ATTACH2/file")]), 1)
+            self.assertEqual((storage_dir / "ATTACH2" / "summary.md").read_text(encoding="utf-8"), "# summary")
+
+    def test_upload_file_to_existing_attachment_uploads_and_mirrors(self):
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith("/items/ATTACH3") and method == "get":
+                response = MagicMock()
+                response.json.return_value = {
+                    "key": "ATTACH3",
+                    "data": {
+                        "key": "ATTACH3",
+                        "itemType": "attachment",
+                        "md5": "OLDMD5",
+                    },
+                }
+                return response
+            if url.endswith("/items/ATTACH3/file") and kwargs.get("data", {}).get("upload"):
+                response = MagicMock()
+                response.json.return_value = {}
+                return response
+            if url.endswith("/items/ATTACH3/file"):
+                response = MagicMock()
+                response.json.return_value = {
+                    "url": "https://upload.example.test",
+                    "contentType": "multipart/form-data; boundary=x",
+                    "prefix": "PREFIX",
+                    "suffix": "SUFFIX",
+                    "uploadKey": "UPLOAD3",
+                }
+                return response
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = ZoteroClient("1", "key", local_storage_dir=Path(tmp) / "zotero-storage")
+            client._request = fake_request
+            storage_dir = client.local_storage_dir
+            assert storage_dir is not None
+            with patch.object(client, "_upload_file_with_retry") as upload:
+                upload.return_value.raise_for_status.return_value = None
+                path = Path(tmp) / "summary.md"
+                path.write_text("# updated", encoding="utf-8")
+
+                client.upload_file_to_attachment("ATTACH3", path, content_type="text/markdown")
+
+                self.assertEqual(calls[-1][2]["data"], {"upload": "UPLOAD3"})
+                self.assertEqual(calls[1][2]["headers"], {"If-Match": "OLDMD5"})
+                self.assertEqual(calls[-1][2]["headers"], {"If-Match": "OLDMD5"})
+                self.assertIn(b"# updated", upload.call_args.args[1])
+                self.assertEqual((storage_dir / "ATTACH3" / "summary.md").read_text(encoding="utf-8"), "# updated")
 
     def test_update_note_preserves_existing_item_data(self):
         client = ZoteroClient("1", "key")

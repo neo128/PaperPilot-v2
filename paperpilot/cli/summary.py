@@ -12,6 +12,7 @@ from paperpilot.clients.arxiv import ArxivClient
 from paperpilot.clients.open_access import OpenAccessClient
 from paperpilot.clients.zotero import ZoteroClient
 from paperpilot.models.results import StageResult
+from paperpilot.services.summary_quality import assess_summary_quality
 from paperpilot.services.summary_service import SummaryOptions, SummaryService
 from paperpilot.services.summary_version import versioned_ai_summary_label
 from paperpilot.storage.paper_summary_store import PaperSummaryStore
@@ -30,7 +31,7 @@ def _cli_args() -> list[str]:
     args = list(sys.argv[1:])
     if args and args[0] == "summary":
         args = args[1:]
-    if args and args[0] == "attach":
+    if args and args[0] in {"attach", "audit"}:
         return args
     while args and not args[0].startswith("-"):
         args = args[1:]
@@ -50,6 +51,16 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument("--force", action="store_true", help="Upload even if a matching attachment already exists.")
         parser.add_argument("--dry-run", action="store_true", help="Preview uploads without writing to Zotero.")
         parser.add_argument("--report-path", help="Write JSON upload report to this path.")
+        return parser.parse_args(cli_args)
+    if cli_args and cli_args[0] == "audit":
+        parser = argparse.ArgumentParser(description="Audit local Markdown AI summaries for quality and completeness.")
+        parser.add_argument("command", choices=["audit"])
+        parser.add_argument("--summary-dir", default=".paperpilot-zotero-attachments/canonical", help="Directory containing AI summary Markdown files.")
+        parser.add_argument("--glob", default="*.md", help="Summary filename glob inside --summary-dir.")
+        parser.add_argument("--source", default="", help="Optional source label: pdf, pdf_text, deepxiv, abstract, metadata_only.")
+        parser.add_argument("--locale", default="zh")
+        parser.add_argument("--fail-under", type=int, default=0, help="Mark summaries below this quality score as failed.")
+        parser.add_argument("--report-path", help="Write JSON audit report to this path.")
         return parser.parse_args(cli_args)
 
     parser = argparse.ArgumentParser(description="Summarize Zotero PDFs and write AI notes.")
@@ -74,8 +85,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--figure-limit", type=int, default=0, help="Maximum extracted figures to insert; 0 means no fixed count limit.")
     parser.add_argument("--no-extract-figures", action="store_true", help="Do not extract and insert PDF figures into generated summaries.")
     parser.add_argument("--download-missing-pdfs", action="store_true", default=True, help="Download open-access PDFs when Zotero PDF attachments are missing or broken.")
-    parser.add_argument("--no-download-missing-pdfs", dest="download_missing_pdfs", action="store_false", help="Do not download missing PDFs; fall back to abstracts when available.")
+    parser.add_argument("--no-download-missing-pdfs", dest="download_missing_pdfs", action="store_false", help="Do not download missing PDFs. Items without PDFs are skipped unless --allow-abstract-card is set.")
     parser.add_argument("--no-attach-downloaded-pdfs", action="store_true", help="Download PDFs locally but do not upload them back to Zotero.")
+    parser.add_argument("--allow-abstract-card", action="store_true", help="When full text/PDF is unavailable, generate a clearly non-canonical abstract-only card.")
+    parser.add_argument("--attach-abstract-card", action="store_true", help="Upload abstract-only cards to Zotero. Off by default to avoid confusing them with full summaries.")
+    parser.add_argument("--allow-truncated-summary", action="store_true", help="Allow summaries from truncated PDF text. They are marked as excerpt_card and are not reusable canonical summaries.")
     parser.add_argument("--unpaywall-email", help="Email for Unpaywall DOI lookup. Defaults to UNPAYWALL_EMAIL.")
     parser.add_argument("--locale", default="zh")
     parser.add_argument("--model", help="Override AI model.")
@@ -202,10 +216,58 @@ def attach_local_summaries(args: argparse.Namespace) -> StageResult:
     return result
 
 
+def audit_local_summaries(args: argparse.Namespace) -> StageResult:
+    summary_dir = Path(args.summary_dir).expanduser()
+    result = StageResult(stage="summary:audit")
+    report: list[dict[str, object]] = []
+
+    for path in sorted(summary_dir.glob(args.glob)):
+        if not path.is_file():
+            continue
+        result.processed += 1
+        try:
+            markdown = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            result.failed += 1
+            result.errors.append(f"{path}: read failed: {exc}")
+            report.append({"path": str(path), "status": "read_failed", "error": str(exc)})
+            continue
+        quality = assess_summary_quality(markdown, source=args.source, locale=args.locale)
+        status = "failed" if args.fail_under and quality.score < args.fail_under else "ok"
+        if status == "failed":
+            result.failed += 1
+        else:
+            result.updated += 1
+        report.append(
+            {
+                "path": str(path),
+                "status": status,
+                **quality.to_dict(),
+            }
+        )
+
+    report.sort(key=lambda row: (int(row.get("score") or 0), str(row.get("path") or "")))
+    report_path = Path(args.report_path).expanduser() if args.report_path else summary_dir / "summary_quality_audit.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    result.artifacts["report"] = str(report_path)
+    label_counts: dict[str, int] = {}
+    for row in report:
+        label = str(row.get("label") or "unknown")
+        label_counts[label] = label_counts.get(label, 0) + 1
+    result.artifacts["label_counts"] = label_counts
+    log_stage_result(result)
+    return result
+
+
 def main() -> None:
     args = parse_args()
     if getattr(args, "command", None) == "attach":
         result = attach_local_summaries(args)
+        print(json.dumps(result.__dict__, ensure_ascii=False, indent=2, default=str))
+        return
+    if getattr(args, "command", None) == "audit":
+        result = audit_local_summaries(args)
         print(json.dumps(result.__dict__, ensure_ascii=False, indent=2, default=str))
         return
 
@@ -259,6 +321,8 @@ def main() -> None:
                 extract_figures=not args.no_extract_figures,
                 figure_limit=args.figure_limit,
                 download_missing_pdfs=False,
+                allow_abstract_fallback=False,
+                allow_truncated_summary=args.allow_truncated_summary,
             ),
             summary_dir=Path(args.summary_dir).expanduser() if args.summary_dir else None,
         )
@@ -310,6 +374,9 @@ def main() -> None:
                 figure_limit=args.figure_limit,
                 download_missing_pdfs=args.download_missing_pdfs,
                 attach_downloaded_pdfs=not args.no_attach_downloaded_pdfs,
+                allow_abstract_fallback=args.allow_abstract_card,
+                attach_abstract_fallback=args.attach_abstract_card,
+                allow_truncated_summary=args.allow_truncated_summary,
             ),
             insert_note=(args.insert_note or not args.pdf_path) and not args.no_zotero_attachment,
         )

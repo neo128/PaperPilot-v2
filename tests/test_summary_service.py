@@ -6,13 +6,14 @@ from paperpilot.services.summary_service import (
     ExtractedFigure,
     SummaryOptions,
     SummaryService,
+    _caption_for_page,
     extract_arxiv_id,
     find_pdf_attachments,
     normalize_arxiv_id,
     resolve_pdf_path,
     make_note_html,
 )
-from paperpilot.storage.paper_summary_store import PaperSummaryStore
+from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryStore
 
 
 class FakeZotero:
@@ -43,22 +44,77 @@ class FakeAI:
         self.calls.append(kwargs)
         return """# 1. 论文基本信息
 
-- 标题：Paper
-- 年份：2026
+- 标题：Paper [原文]
+- 年份：2026 [原文]
+- 研究领域：机器人学习与系统评估 [原文]
+- 关键词：compact architecture, benchmark, accuracy [原文]
+- 任务类型：方法论文 [原文]
 
 # 2. 一句话总结
 
-## 原文明确内容
+该论文提出一种紧凑架构，用于在给定基准上完成测试任务，并报告了 91.2% 的准确率。[原文]
 
-This is a test summary.
+# 3. 研究问题
 
-# 3. 方法与架构
+现有方法在测试基准上需要更清晰的模块组织和可复用评估流程；论文希望用较小的系统结构支撑稳定评估。[原文]
+
+# 4. 方法概述
 
 The method uses a compact architecture.
 
+该方法输入论文测试文本与任务配置，输出结构化预测结果；核心模块包括特征整理、紧凑架构推理与结果评估。[原文]
+
+# 5. 技术流程拆解（Step-by-step）
+
+Step 1：读取任务输入并整理为模型可处理的特征表示，输出标准化输入。[原文]
+Step 2：通过紧凑架构完成推理，输出候选预测。[原文]
+Step 3：在 benchmark 上计算准确率，输出可比较的实验结果。[原文]
+
+# 6. 创新点评估（必须分级）
+
+- 紧凑架构设计：【创新类型】工程；【创新强度】中；【是否已有类似工作】有；【是否容易被替代】中。[推断]
+
+# 7. 技术坐标系定位
+
+该方法偏 black-box 行为优化，重点在系统结构和评估结果，而不是内部机制解释。[推断]
+
 # 8. 实验与结果
 
-- Accuracy reaches 91.2% on the benchmark.（91.2% benchmark result）
+- 数据集/任务：benchmark 测试任务。[原文]
+- 指标：Accuracy。[原文]
+- 主要结果：Accuracy reaches 91.2% on the benchmark.（91.2% benchmark result）[原文]
+- 消融实验：原文未包含该类信息。[原文]
+- 泛化实验：原文未包含该类信息。[原文]
+
+# 9. 局限性
+
+作者未展开更多真实部署和跨数据集泛化结果；这限制了结论的外推范围。[推断]
+
+# 10. 失败模式（关键）
+
+若输入分布明显偏离 benchmark，紧凑架构可能出现性能下降；该失败可通过额外验证集检测，也可通过扩展训练数据修复。[推断]
+
+# 11. 通用复用价值
+
+该论文适合作为方法对比、轻量架构设计和指标记录的示例材料。[启发]
+
+# 12. 分类标签（结构化）
+
+任务类型：方法评估；方法类型：紧凑架构；数据类型：benchmark；是否使用真实机器人数据：否；是否使用仿真：原文未包含该类信息；是否使用语言：原文未包含该类信息；是否使用视觉：原文未包含该类信息；是否涉及动作序列：否；是否涉及世界模型：否；是否涉及 VLA：否；是否涉及记忆/语义表示：否；是否支持长程任务：否。[原文]
+
+# 13. 跨域适配与具身智能启发（可选）
+
+非具身智能论文。该紧凑架构思路可启发机器人系统在资源受限场景中做模块裁剪，但这属于跨域迁移设想。[启发]
+
+# 14. 潜在研究机会
+
+- 背景问题：轻量系统在复杂任务上容易泛化不足；未解决空白：缺少跨场景验证；技术路线：增加多基准评估；预期价值：提高工程可靠性；难点：构造覆盖充分的测试集。[启发]
+- 背景问题：单一准确率难解释错误来源；未解决空白：缺少错误分解；技术路线：加入失败模式分类；预期价值：辅助系统调试；难点：错误标注成本较高。[启发]
+
+# 15. 高质量证据片段（强约束）
+
+- 中文证据转述：论文报告 benchmark 上准确率为 91.2%；定位短语：91.2% benchmark result；支撑结论：该方法有明确指标结果；为什么能支撑：该短语直接给出指标和测试语境。[原文]
+- 中文证据转述：论文方法使用 compact architecture；定位短语：compact architecture；支撑结论：核心设计是紧凑架构；为什么能支撑：该短语直接命名方法结构。[原文]
 """
 
 
@@ -154,16 +210,33 @@ class SummaryServiceTest(unittest.TestCase):
         self.assertEqual(result.processed, 1)
         self.assertEqual(result.skipped, 1)
 
-    def test_fallback_to_abstract_when_no_pdf(self):
+    def test_default_skips_abstract_when_no_pdf(self):
         zotero = FakeZotero()
         service = SummaryService(zotero, FakeAI(), Path("/tmp"))
         items = [{"data": {"key": "ITEMA", "title": "Paper", "itemType": "journalArticle", "abstractNote": "This is the abstract."}}]
         result = service.summarize_items(items, SummaryOptions(), insert_note=True)
-        self.assertEqual(result.created, 1)
+        self.assertEqual(result.created, 0)
+        self.assertEqual(result.skipped, 1)
         self.assertEqual(zotero.notes, [])
-        self.assertEqual(len(zotero.attachments), 1)
-        self.assertEqual(zotero.attachments[0][3], "text/markdown")
-        self.assertIn("AI总结-v2-md", zotero.attachments[0][4])
+        self.assertEqual(zotero.attachments, [])
+
+    def test_explicit_abstract_card_does_not_upload_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            zotero = FakeZotero()
+            service = SummaryService(zotero, FakeAI(), Path(tmp), summary_store=store)
+            items = [{"data": {"key": "ITEMA", "title": "Paper", "itemType": "journalArticle", "abstractNote": "This is the abstract."}}]
+
+            result = service.summarize_items(items, SummaryOptions(allow_abstract_fallback=True), insert_note=True)
+
+            self.assertEqual(result.created, 1)
+            self.assertEqual(zotero.notes, [])
+            self.assertEqual(zotero.attachments, [])
+            summary = store.get_by_zotero_key("ITEMA")
+            self.assertEqual(summary.summary_kind, "abstract_card")
+            self.assertEqual(summary.summary_profile, "abstract_card")
+            self.assertEqual(summary.source_coverage, "abstract_only")
+            store.close()
 
     def test_summary_attachment_skips_existing_markdown_attachment(self):
         zotero = FakeZotero()
@@ -186,7 +259,7 @@ class SummaryServiceTest(unittest.TestCase):
         self.assertEqual(attachment_key, "EXISTING")
         self.assertEqual(zotero.attachments, [])
 
-    def test_summary_attachment_embeds_local_images_for_zotero(self):
+    def test_summary_attachment_keeps_local_image_links_for_zotero(self):
         with tempfile.TemporaryDirectory() as tmp:
             zotero = FakeZotero()
             service = SummaryService(zotero, FakeAI(), Path(tmp))
@@ -199,8 +272,15 @@ class SummaryServiceTest(unittest.TestCase):
             self.assertEqual(attachment_key, "ATTACH1")
             md_path = Path(zotero.attachments[0][2])
             md = md_path.read_text(encoding="utf-8")
-            self.assertIn("data:image/png;base64,", md)
-            self.assertNotIn(str(image_path), md)
+            self.assertNotIn("data:image/png;base64,", md)
+            self.assertIn(str(image_path), md)
+
+    def test_caption_for_page_requires_explicit_figure_or_table_caption(self):
+        self.assertEqual(_caption_for_page("Title\nNo figure caption here."), "")
+        caption = _caption_for_page(
+            "Some text. Figure 1: World model architecture with vision, memory, and controller modules. More text."
+        )
+        self.assertTrue(caption.startswith("Figure 1: World model architecture"))
 
     def test_summary_writes_sqlite_record_and_facts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,14 +289,16 @@ class SummaryServiceTest(unittest.TestCase):
             service = SummaryService(zotero, FakeAI(), Path(tmp), summary_store=store)
             items = [{"data": {"key": "ITEMA", "title": "Paper", "itemType": "journalArticle", "abstractNote": "This is the abstract."}}]
 
-            result = service.summarize_items(items, SummaryOptions(), insert_note=False)
+            result = service.summarize_items(items, SummaryOptions(allow_abstract_fallback=True), insert_note=False)
 
             self.assertEqual(result.created, 1)
             self.assertTrue(store.has_summary("ITEMA"))
             self.assertGreaterEqual(len(store.list_facts(fact_type="metric")), 1)
             summary = store.get_by_zotero_key("ITEMA")
-            self.assertEqual(summary.summary_kind, "canonical")
-            self.assertEqual(summary.summary_profile, "general")
+            self.assertEqual(summary.summary_kind, "abstract_card")
+            self.assertEqual(summary.summary_profile, "abstract_card")
+            self.assertIsNotNone(summary.quality_score)
+            self.assertTrue(summary.quality_label)
             store.close()
 
     def test_reuses_canonical_summary_for_duplicate_paper_items(self):
@@ -230,13 +312,47 @@ class SummaryServiceTest(unittest.TestCase):
                 {"data": {"key": "ITEMB", "title": "Same Paper", "itemType": "journalArticle", "abstractNote": "Abstract B"}},
             ]
 
-            result = service.summarize_items(items, SummaryOptions(), insert_note=True)
+            result = service.summarize_items(items, SummaryOptions(allow_abstract_fallback=True), insert_note=True)
+
+            self.assertEqual(result.created, 2)
+            self.assertEqual(result.skipped, 0)
+            self.assertEqual(result.failed, 0)
+            self.assertEqual(len(ai.calls), 2)
+            self.assertEqual(zotero.attachments, [])
+            store.close()
+
+    def test_low_quality_cached_canonical_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            store.save(
+                PaperSummary(
+                    paper_id="bad_cached",
+                    zotero_key="OLDITEM",
+                    title="Same Paper",
+                    full_summary_md="# Bad\n当前批量总结：题名和元数据表明，需要进一步确认。",
+                    source="pdf",
+                    summary_version="v2",
+                    summary_kind="canonical",
+                    canonical_key="title:same paper",
+                    quality_score=0,
+                    quality_label="metadata_card",
+                    source_coverage="metadata_only",
+                )
+            )
+            zotero = FakeZotero()
+            ai = FakeAI()
+            service = SummaryService(zotero, ai, Path(tmp), summary_store=store)
+
+            result = service.summarize_items(
+                [{"data": {"key": "ITEMA", "title": "Same Paper", "itemType": "journalArticle", "abstractNote": "Abstract A"}}],
+                SummaryOptions(allow_abstract_fallback=True),
+                insert_note=False,
+            )
 
             self.assertEqual(result.created, 1)
-            self.assertEqual(result.skipped, 1)
-            self.assertEqual(result.failed, 0)
             self.assertEqual(len(ai.calls), 1)
-            self.assertEqual(len(zotero.attachments), 2)
+            summary = store.get_by_zotero_key("ITEMA")
+            self.assertIsNotNone(summary)
             store.close()
 
     def test_force_summary_regenerates_duplicate_canonical_only_once_per_batch(self):
@@ -250,13 +366,13 @@ class SummaryServiceTest(unittest.TestCase):
                 {"data": {"key": "ITEMB", "title": "Same Paper", "itemType": "journalArticle", "abstractNote": "Abstract B"}},
             ]
 
-            result = service.summarize_items(items, SummaryOptions(force=True), insert_note=True)
+            result = service.summarize_items(items, SummaryOptions(force=True, allow_abstract_fallback=True), insert_note=True)
 
-            self.assertEqual(result.created, 1)
-            self.assertEqual(result.skipped, 1)
+            self.assertEqual(result.created, 2)
+            self.assertEqual(result.skipped, 0)
             self.assertEqual(result.failed, 0)
-            self.assertEqual(len(ai.calls), 1)
-            self.assertEqual(len(zotero.attachments), 2)
+            self.assertEqual(len(ai.calls), 2)
+            self.assertEqual(zotero.attachments, [])
             store.close()
 
     def test_use_deepxiv_before_pdf_fallback(self):
@@ -384,6 +500,31 @@ class SummaryServiceTest(unittest.TestCase):
             figures = store.list_figures()
             self.assertEqual(len(figures), 1)
             self.assertEqual(figures[0].caption, "Figure 1. System architecture")
+            store.close()
+
+    def test_refuses_truncated_pdf_summary_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "long.pdf"
+            pdf_path.write_bytes(b"not-a-real-pdf")
+            store = PaperSummaryStore(Path(tmp) / "summaries.sqlite3")
+            ai = FakeAI()
+            service = SummaryService(None, ai, Path(tmp), summary_store=store)
+            service_module = __import__("paperpilot.services.summary_service", fromlist=["extract_pdf_text"])
+            old_extract = service_module.extract_pdf_text
+            service_module.extract_pdf_text = lambda path, max_pages: "很长的论文文本" * 1000
+            try:
+                result = service.summarize_local_pdfs(
+                    [pdf_path],
+                    SummaryOptions(max_chars=100),
+                    summary_dir=Path(tmp) / "out",
+                )
+            finally:
+                service_module.extract_pdf_text = old_extract
+
+            self.assertEqual(result.created, 0)
+            self.assertEqual(result.failed, 1)
+            self.assertEqual(ai.calls, [])
+            self.assertEqual(store.count(), 0)
             store.close()
 
 

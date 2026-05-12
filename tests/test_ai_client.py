@@ -15,6 +15,17 @@ class CapturingAIClient(AIClient):
 
 
 class AIClientPromptTest(unittest.TestCase):
+    def test_truncate_text_removes_invalid_surrogates(self):
+        cleaned = AIClient.truncate_text("valid \ud835 text", 100)
+
+        self.assertEqual(cleaned, "valid  text")
+        cleaned.encode("utf-8")
+
+    def test_truncate_text_zero_means_no_limit(self):
+        text = "abc" * 100
+
+        self.assertEqual(AIClient.truncate_text(text, 0), text)
+
     def test_chinese_summary_prompt_uses_canonical_template(self):
         ai = CapturingAIClient()
 
@@ -42,7 +53,8 @@ class AIClientPromptTest(unittest.TestCase):
         self.assertIn("## 1. 论文基本信息", prompt)
         self.assertIn("## 6. 创新点评估", prompt)
         self.assertIn("## 11. 通用复用价值", prompt)
-        self.assertIn("## 13. 跨域适配与具身智能启发", prompt)
+        self.assertIn("## 13. 跨域适配与领域迁移启发", prompt)
+        self.assertIn("不要强行写机器人适配、主动探索或世界模型启发", prompt)
         self.assertIn("## 15. 高质量证据片段", prompt)
         self.assertIn("论文标题：Robot Paper", prompt)
         self.assertIn("用户提供的论文内容", prompt)
