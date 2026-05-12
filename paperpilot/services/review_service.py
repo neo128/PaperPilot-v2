@@ -4,6 +4,7 @@ import csv
 import datetime as dt
 import html
 import json
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -12,10 +13,14 @@ from typing import Any, Iterable, Optional
 
 from paperpilot.models.results import StageResult
 from paperpilot.services.markdown_render import render_markdown_html
+from paperpilot.services.summary_quality import assess_summary_quality
 from paperpilot.services.summary_service import SummaryOptions, SummaryService, canonical_key_from_metadata, extract_pdf_text, file_sha256
 from paperpilot.services.summary_version import AI_SUMMARY_VERSION, versioned_ai_summary_label
 from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryFact, PaperSummaryStore
 from paperpilot.storage.summary_parser import extract_structured_fields, extract_summary_facts
+
+
+logger = logging.getLogger(__name__)
 
 
 PAPER_POOL_FIELDS = [
@@ -2518,26 +2523,10 @@ class LiteratureReviewService:
                 except Exception:
                     continue
 
-        abstract = (row.get("abstract") or "").strip()
-        if abstract:
-            summary_service.summarize_text(
-                title=title,
-                text=abstract,
-                zotero_key=zotero_key,
-                options=SummaryOptions(
-                    max_chars=min(options.max_chars, 4000),
-                    locale=options.locale,
-                    force=options.force_summary,
-                    mode="general",
-                ),
-                source="abstract",
-                canonical_key=canonical_key,
-                insert_attachment=bool(self.zotero and zotero_key),
-            )
-            return self.summary_store.get_latest_canonical(
-                zotero_key=zotero_key,
-                canonical_key=canonical_key,
-                summary_version=AI_SUMMARY_VERSION,
+        if (row.get("abstract") or "").strip():
+            logger.warning(
+                "review: only abstract available for canonical summary; skipping non-canonical fallback paper=%s",
+                title,
             )
         return None
 
@@ -2694,6 +2683,11 @@ class LiteratureReviewService:
                 "summary_profile": "review",
             }
         )
+        quality = assess_summary_quality(card_md, source=source, locale="zh")
+        fields["quality_score"] = quality.score
+        fields["quality_label"] = quality.label
+        fields["quality_findings"] = json.dumps(quality.findings, ensure_ascii=False)
+        fields["source_coverage"] = quality.source_coverage
         facts = [
             PaperSummaryFact(paper_id=store_paper_id, **fact)
             for fact in extract_summary_facts(

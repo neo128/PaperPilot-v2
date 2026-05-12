@@ -38,6 +38,10 @@ class AIClient:
         self.client = OpenAI(api_key=settings.api_key, base_url=settings.base_url, http_client=http_client)
 
     def chat(self, messages: list[dict[str, str]], model: Optional[str] = None, **kwargs: Any) -> str:
+        messages = [
+            {**message, "content": self.clean_text_for_json(message.get("content", ""))}
+            for message in messages
+        ]
         response = self.client.chat.completions.create(
             model=model or self.settings.model,
             messages=messages,
@@ -46,7 +50,16 @@ class AIClient:
         return response.choices[0].message.content or ""
 
     @staticmethod
+    def clean_text_for_json(text: str) -> str:
+        if not text:
+            return ""
+        return text.encode("utf-8", "ignore").decode("utf-8")
+
+    @staticmethod
     def truncate_text(text: str, max_chars: int) -> str:
+        text = AIClient.clean_text_for_json(text)
+        if max_chars <= 0:
+            return text or ""
         if not text or len(text) <= max_chars:
             return text or ""
         cut = text[:max_chars]
@@ -68,12 +81,22 @@ class AIClient:
     ) -> str:
         excerpt = self.truncate_text(text or "", max_chars)
         if mode == "brief":
-            system_msg = "You are a precise research-paper screening assistant."
-            prompt = (
-                f"Summarize this paper briefly in Markdown, strictly based on the supplied text. "
-                "Return: one-line summary, key method, evidence-backed result if present, limitations, and whether it deserves full reading.\n\n"
-                f"Title: {title}\n\nText:\n{excerpt}"
-            )
+            if (locale or "").lower().startswith("zh"):
+                system_msg = "你是一名严谨的论文预筛助手。"
+                prompt = (
+                    "请基于提供的摘要/片段生成**非 canonical 的摘要卡**，使用中文 Markdown。"
+                    "不要冒充阅读全文；不要写成完整 AI 总结；所有事实只允许来自输入文本。\n\n"
+                    "必须包含：来源限制、一句话摘要、关键方法/观点、可确认结果、缺失信息、是否值得获取全文精读。\n"
+                    "如果输入只包含摘要或元数据，明确写“来源覆盖：abstract_only”。\n\n"
+                    f"论文标题：{title}\n\n输入文本：\n{excerpt}"
+                )
+            else:
+                system_msg = "You are a precise research-paper screening assistant."
+                prompt = (
+                    f"Summarize this paper briefly in Markdown, strictly based on the supplied text. "
+                    "Return: source limitation, one-line summary, key method, evidence-backed result if present, missing information, and whether it deserves full reading.\n\n"
+                    f"Title: {title}\n\nText:\n{excerpt}"
+                )
             return self.chat(
                 [
                     {"role": "system", "content": system_msg},

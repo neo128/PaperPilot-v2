@@ -40,6 +40,10 @@ def test_store_create_and_save():
 
         fields = extract_structured_fields(SAMPLE_MD, zotero_key="ABC123", title_hint="Test Paper")
         fields["paper_id"] = "test_001"
+        fields["quality_score"] = 88
+        fields["quality_label"] = "usable"
+        fields["quality_findings"] = "[\"ok\"]"
+        fields["source_coverage"] = "pdf_text"
 
         store.save(PaperSummary(**fields))
 
@@ -51,6 +55,9 @@ def test_store_create_and_save():
         assert retrieved.authors == "Alice, Bob"
         assert "new method for X" in (retrieved.one_line_summary or "")
         assert "fail to handle Y" in (retrieved.research_problem or "")
+        assert retrieved.quality_score == 88
+        assert retrieved.quality_label == "usable"
+        assert retrieved.source_coverage == "pdf_text"
 
         store.close()
 
@@ -239,4 +246,4 @@ def test_fact_extraction_uses_conservative_confidence_rules():
     assert not any("digital platforms" in context for context in metric_contexts + platform_contexts)
     assert not any("[启发]" in context for context in metric_contexts + platform_contexts)
     assert any("91.2%" in context for context in metric_contexts)
-    assert any("[原文] The method is evaluated in the Habitat simulator." in context for context in platform_contexts)
+    assert not any("[原文] The method is evaluated in the Habitat simulator." in context for context in platform_contexts)

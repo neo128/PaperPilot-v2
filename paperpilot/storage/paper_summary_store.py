@@ -57,6 +57,15 @@ class PaperSummary:
     zotero_attachment_title: Optional[str] = None
     attached_at: Optional[str] = None
     attachment_status: Optional[str] = None
+    quality_score: Optional[int] = None
+    quality_label: Optional[str] = None
+    quality_findings: Optional[str] = None
+    source_coverage: Optional[str] = None
+    source_completeness: Optional[str] = None
+    is_input_truncated: Optional[int] = None
+    input_char_count: Optional[int] = None
+    used_char_count: Optional[int] = None
+    template_profile: Optional[str] = None
 
 
 @dataclass
@@ -165,7 +174,16 @@ class PaperSummaryStore:
                 zotero_attachment_key TEXT,
                 zotero_attachment_title TEXT,
                 attached_at TEXT,
-                attachment_status TEXT
+                attachment_status TEXT,
+                quality_score INTEGER,
+                quality_label TEXT,
+                quality_findings TEXT,
+                source_coverage TEXT,
+                source_completeness TEXT,
+                is_input_truncated INTEGER,
+                input_char_count INTEGER,
+                used_char_count INTEGER,
+                template_profile TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_summary_facts (
                 fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,6 +244,21 @@ class PaperSummaryStore:
                 self.conn.execute(f"ALTER TABLE paper_summaries ADD COLUMN {col} TEXT DEFAULT ''")
             except Exception:
                 pass
+        for col, definition in [
+            ("quality_score", "INTEGER"),
+            ("quality_label", "TEXT DEFAULT ''"),
+            ("quality_findings", "TEXT DEFAULT ''"),
+            ("source_coverage", "TEXT DEFAULT ''"),
+            ("source_completeness", "TEXT DEFAULT ''"),
+            ("is_input_truncated", "INTEGER DEFAULT 0"),
+            ("input_char_count", "INTEGER DEFAULT 0"),
+            ("used_char_count", "INTEGER DEFAULT 0"),
+            ("template_profile", "TEXT DEFAULT ''"),
+        ]:
+            try:
+                self.conn.execute(f"ALTER TABLE paper_summaries ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
         self.conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_summaries_zotero ON paper_summaries(zotero_key);
             CREATE INDEX IF NOT EXISTS idx_summaries_title ON paper_summaries(title);
@@ -236,6 +269,8 @@ class PaperSummaryStore:
             CREATE INDEX IF NOT EXISTS idx_summaries_review_slug ON paper_summaries(review_slug);
             CREATE INDEX IF NOT EXISTS idx_summaries_canonical ON paper_summaries(canonical_key);
             CREATE INDEX IF NOT EXISTS idx_summaries_pdf_hash ON paper_summaries(pdf_hash);
+            CREATE INDEX IF NOT EXISTS idx_summaries_quality_label ON paper_summaries(quality_label);
+            CREATE INDEX IF NOT EXISTS idx_summaries_source_coverage ON paper_summaries(source_coverage);
             CREATE INDEX IF NOT EXISTS idx_summary_facts_paper ON paper_summary_facts(paper_id);
             CREATE INDEX IF NOT EXISTS idx_summary_facts_zotero ON paper_summary_facts(zotero_key);
             CREATE INDEX IF NOT EXISTS idx_summary_facts_type ON paper_summary_facts(fact_type);
@@ -260,66 +295,70 @@ class PaperSummaryStore:
         facts: Optional[list[PaperSummaryFact]] = None,
         figures: Optional[list[PaperSummaryFigure]] = None,
     ) -> None:
+        columns = [
+            "paper_id",
+            "zotero_key",
+            "title",
+            "year",
+            "authors",
+            "institution",
+            "field",
+            "keywords",
+            "task_type",
+            "one_line_summary",
+            "research_problem",
+            "method_overview",
+            "technical_route",
+            "innovations",
+            "tech_coordination",
+            "experiments",
+            "limitations",
+            "failure_modes",
+            "review_value",
+            "tags",
+            "robot_task_modeling",
+            "data_and_platform",
+            "perception_decision_control",
+            "generalization_deployment",
+            "research_opportunities",
+            "evidence",
+            "full_summary_md",
+            "locale",
+            "model",
+            "created_at",
+            "source",
+            "summary_version",
+            "summary_kind",
+            "review_slug",
+            "pdf_hash",
+            "canonical_key",
+            "summary_profile",
+            "source_priority",
+            "stale_reason",
+            "zotero_attachment_key",
+            "zotero_attachment_title",
+            "attached_at",
+            "attachment_status",
+            "quality_score",
+            "quality_label",
+            "quality_findings",
+            "source_coverage",
+            "source_completeness",
+            "is_input_truncated",
+            "input_char_count",
+            "used_char_count",
+            "template_profile",
+        ]
+        values = [
+            summary.created_at or utc_now() if column == "created_at" else getattr(summary, column)
+            for column in columns
+        ]
         self.conn.execute(
-            """
-            INSERT INTO paper_summaries (
-                paper_id, zotero_key, title, year, authors, institution, field,
-                keywords, task_type, one_line_summary, research_problem,
-                method_overview, technical_route, innovations, tech_coordination,
-                experiments, limitations, failure_modes, review_value, tags,
-                robot_task_modeling, data_and_platform, perception_decision_control,
-                generalization_deployment, research_opportunities,
-                evidence, full_summary_md, locale, model, created_at, source,
-                summary_version, summary_kind, review_slug, pdf_hash, canonical_key,
-                summary_profile, source_priority, stale_reason, zotero_attachment_key,
-                zotero_attachment_title, attached_at, attachment_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO paper_summaries ({", ".join(columns)})
+            VALUES ({", ".join(["?"] * len(columns))})
             """,
-            (
-                summary.paper_id,
-                summary.zotero_key,
-                summary.title,
-                summary.year,
-                summary.authors,
-                summary.institution,
-                summary.field,
-                summary.keywords,
-                summary.task_type,
-                summary.one_line_summary,
-                summary.research_problem,
-                summary.method_overview,
-                summary.technical_route,
-                summary.innovations,
-                summary.tech_coordination,
-                summary.experiments,
-                summary.limitations,
-                summary.failure_modes,
-                summary.review_value,
-                summary.tags,
-                summary.robot_task_modeling,
-                summary.data_and_platform,
-                summary.perception_decision_control,
-                summary.generalization_deployment,
-                summary.research_opportunities,
-                summary.evidence,
-                summary.full_summary_md,
-                summary.locale,
-                summary.model,
-                summary.created_at or utc_now(),
-                summary.source,
-                summary.summary_version,
-                summary.summary_kind,
-                summary.review_slug,
-                summary.pdf_hash,
-                summary.canonical_key,
-                summary.summary_profile,
-                summary.source_priority,
-                summary.stale_reason,
-                summary.zotero_attachment_key,
-                summary.zotero_attachment_title,
-                summary.attached_at,
-                summary.attachment_status,
-            ),
+            tuple(values),
         )
         for fact in facts or []:
             self.save_fact(fact)
@@ -568,6 +607,15 @@ class PaperSummaryStore:
             zotero_attachment_title=row["zotero_attachment_title"],
             attached_at=row["attached_at"],
             attachment_status=row["attachment_status"],
+            quality_score=row["quality_score"] if row["quality_score"] not in ("", None) else None,
+            quality_label=row["quality_label"],
+            quality_findings=row["quality_findings"],
+            source_coverage=row["source_coverage"],
+            source_completeness=row["source_completeness"],
+            is_input_truncated=row["is_input_truncated"],
+            input_char_count=row["input_char_count"],
+            used_char_count=row["used_char_count"],
+            template_profile=row["template_profile"],
         )
 
     @staticmethod

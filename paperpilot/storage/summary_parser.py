@@ -239,15 +239,20 @@ def _content_lines(text: str) -> list[str]:
 
 def _infer_fact_type(line: str, section_no: str) -> str:
     lowered = line.lower()
-    if section_no == "15" or "证据" in line or "evidence" in lowered:
-        return "evidence"
     if "[启发]" in line:
+        return ""
+    if section_no in {"13", "14"}:
         return ""
     if any(token in line for token in ["原文未包含", "未包含该类实验", "无实证数据集", "无量化指标", "无算法训练"]):
         return ""
+    author_fact = "[原文]" in line or "【原文】" in line or "原文" in line
+    if section_no == "15" or "证据" in line or "evidence" in lowered:
+        return "evidence" if author_fact else ""
+    if not author_fact and section_no in {"8", "12"}:
+        return ""
 
     experiment_sections = {"8", "15"}
-    concrete_sections = experiment_sections | {"12", "13"}
+    concrete_sections = experiment_sections | {"12"}
     numeric = re.search(
         r"\d+(?:\.\d+)?\s*(?:%|percent|分|x|×|倍|fps|hz|ms|s|sec|seconds|hours|episodes|steps|trials|tasks|scenes|objects|environments|datasets)?",
         lowered,

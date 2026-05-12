@@ -254,11 +254,10 @@ class LiteratureReviewServiceTest(unittest.TestCase):
             result = service.read_and_code(project, ReviewReadOptions(limit=1))
 
             self.assertEqual(result.created, 1)
-            self.assertEqual(ai.summary_calls, 1)
-            self.assertEqual(store.count(), 2)
+            self.assertEqual(ai.summary_calls, 0)
+            self.assertEqual(store.count(), 1)
             canonical = store.get_latest_canonical(zotero_key="A", summary_version="v2")
-            self.assertIsNotNone(canonical)
-            self.assertEqual(canonical.summary_kind, "canonical")
+            self.assertIsNone(canonical)
             review_summary = store.get_by_zotero_key("A")
             self.assertEqual(review_summary.summary_kind, "review_reading")
             self.assertEqual(review_summary.review_slug, "agent-memory")
@@ -278,7 +277,7 @@ class LiteratureReviewServiceTest(unittest.TestCase):
 
             self.assertEqual(first.created, 1)
             self.assertEqual(second.created, 1)
-            self.assertEqual(ai.summary_calls, 1)
+            self.assertEqual(ai.summary_calls, 0)
             self.assertEqual(ai.read_calls, 2)
             store.close()
 

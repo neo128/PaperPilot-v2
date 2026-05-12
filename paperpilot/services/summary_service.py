@@ -5,6 +5,7 @@ from datetime import timezone
 import base64
 import hashlib
 import html
+import json
 import logging
 import mimetypes
 import time
@@ -26,6 +27,7 @@ except ImportError:
     DeepXivClient = None  # type: ignore[misc,assignment]
 from paperpilot.models.results import StageResult
 from paperpilot.services.markdown_render import render_markdown_html
+from paperpilot.services.summary_quality import assess_summary_quality
 from paperpilot.services.summary_version import AI_SUMMARY_VERSION, versioned_ai_summary_label
 from paperpilot.storage.paper_summary_store import PaperSummary, PaperSummaryFact, PaperSummaryFigure, PaperSummaryStore
 from paperpilot.storage.summary_parser import extract_structured_fields, extract_summary_facts
@@ -49,6 +51,9 @@ class SummaryOptions:
     figure_limit: int = 0
     download_missing_pdfs: bool = False
     attach_downloaded_pdfs: bool = True
+    allow_abstract_fallback: bool = False
+    attach_abstract_fallback: bool = False
+    allow_truncated_summary: bool = False
 
 
 @dataclass
@@ -128,6 +133,20 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def text_would_be_truncated(text: str, max_chars: int) -> bool:
+    """Return whether AIClient.truncate_text would reduce this text."""
+    if max_chars <= 0:
+        return False
+    cleaned = AIClient.clean_text_for_json(text or "")
+    return len(cleaned) > max_chars
+
+
+def used_text_char_count(text: str, max_chars: int) -> int:
+    if max_chars <= 0:
+        return len(AIClient.clean_text_for_json(text or ""))
+    return min(len(AIClient.clean_text_for_json(text or "")), max_chars)
+
+
 def canonical_key_from_metadata(data: dict[str, Any], title_hint: str = "") -> str:
     doi = str(data.get("DOI") or data.get("doi") or "").strip().lower()
     if doi:
@@ -146,9 +165,17 @@ def _safe_asset_key(value: str) -> str:
 
 
 def _caption_for_page(page_text: str) -> str:
+    compact_text = " ".join((page_text or "").split())
+    caption_match = re.search(
+        r"\b(?:fig(?:ure)?|table)\s*\.?\s*\d+[A-Za-z]?\s*[:.\-]?\s+.{20,300}",
+        compact_text,
+        re.I,
+    )
+    if caption_match:
+        return caption_match.group(0)[:300]
     for line in (page_text or "").splitlines():
         cleaned = " ".join(line.strip().split())
-        if re.match(r"^(fig(?:ure)?|table)\s*\\d*", cleaned, re.I):
+        if re.match(r"^(fig(?:ure)?|table)\s*\.?\s*\d+[A-Za-z]?\b", cleaned, re.I):
             return cleaned[:300]
     return ""
 
@@ -284,26 +311,44 @@ class SummaryService:
         source_priority: Optional[int] = None,
         stale_reason: Optional[str] = None,
         figures: Optional[list[ExtractedFigure]] = None,
+        quality_source: Optional[str] = None,
+        source_completeness: Optional[str] = None,
+        is_input_truncated: bool = False,
+        input_char_count: Optional[int] = None,
+        used_char_count: Optional[int] = None,
+        template_profile: Optional[str] = None,
     ) -> Optional[str]:
         if not self.summary_store or not summary:
             return None
+        quality_source = quality_source or source or ""
         fields = extract_structured_fields(
             summary,
             zotero_key=zotero_key,
             title_hint=title,
             locale=locale,
             model=model,
-            source=source,
+            source=quality_source,
         )
         fields["paper_id"] = f"summary_{zotero_key}_{dt.datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         fields["summary_version"] = AI_SUMMARY_VERSION
         fields["summary_kind"] = summary_kind
         fields["review_slug"] = review_slug
+        fields["source"] = source
         fields["pdf_hash"] = pdf_hash
         fields["canonical_key"] = canonical_key or (f"zotero:{zotero_key}" if zotero_key else "")
         fields["summary_profile"] = summary_profile
         fields["source_priority"] = source_priority
         fields["stale_reason"] = stale_reason
+        fields["source_completeness"] = source_completeness
+        fields["is_input_truncated"] = 1 if is_input_truncated else 0
+        fields["input_char_count"] = input_char_count or 0
+        fields["used_char_count"] = used_char_count or 0
+        fields["template_profile"] = template_profile or summary_profile
+        quality = assess_summary_quality(summary, source=quality_source, locale=locale)
+        fields["quality_score"] = quality.score
+        fields["quality_label"] = quality.label
+        fields["quality_findings"] = json.dumps(quality.findings, ensure_ascii=False)
+        fields["source_coverage"] = quality.source_coverage
         facts = [
             PaperSummaryFact(paper_id=fields["paper_id"], **fact)
             for fact in extract_summary_facts(
@@ -335,21 +380,53 @@ class SummaryService:
     def _cached_canonical(self, *, zotero_key: str, canonical_key: str, pdf_hash: Optional[str], options: SummaryOptions) -> Optional[PaperSummary]:
         if not self.summary_store or options.force:
             return None
-        return self.summary_store.get_valid_canonical(
+        cached = self.summary_store.get_valid_canonical(
             zotero_key=zotero_key,
             canonical_key=canonical_key,
             summary_version=AI_SUMMARY_VERSION,
             pdf_hash=pdf_hash,
         )
+        if cached and not self._summary_quality_reusable(cached):
+            logger.info(
+                "summary: cached canonical rejected by quality gate item_key=%s canonical_key=%s quality_label=%s quality_score=%s",
+                zotero_key,
+                canonical_key,
+                cached.quality_label,
+                cached.quality_score,
+            )
+            return None
+        return cached
 
     def _cached_by_canonical_key(self, *, canonical_key: str, pdf_hash: Optional[str] = None) -> Optional[PaperSummary]:
         if not self.summary_store or not canonical_key:
             return None
-        return self.summary_store.get_valid_canonical(
+        cached = self.summary_store.get_valid_canonical(
             canonical_key=canonical_key,
             summary_version=AI_SUMMARY_VERSION,
             pdf_hash=pdf_hash,
         )
+        if cached and not self._summary_quality_reusable(cached):
+            logger.info(
+                "summary: cached canonical rejected by quality gate canonical_key=%s quality_label=%s quality_score=%s",
+                canonical_key,
+                cached.quality_label,
+                cached.quality_score,
+            )
+            return None
+        return cached
+
+    @staticmethod
+    def _summary_quality_reusable(summary: PaperSummary) -> bool:
+        label = (summary.quality_label or "").strip()
+        if label in {"metadata_card", "abstract_card", "excerpt_card", "needs_rebuild"}:
+            return False
+        if summary.quality_score is not None and int(summary.quality_score) < 50:
+            return False
+        if (summary.source_coverage or "").strip() in {"metadata_only", "abstract_only", "pdf_excerpt"}:
+            return False
+        if int(summary.is_input_truncated or 0):
+            return False
+        return True
 
     def _reuse_summary_for_item(
         self,
@@ -374,20 +451,12 @@ class SummaryService:
         return True
 
     def _markdown_with_embedded_local_images(self, summary_md: str) -> str:
-        def repl(match: re.Match[str]) -> str:
-            alt = match.group("alt")
-            target = match.group("target").strip()
-            if target.startswith(("http://", "https://", "data:", "zotero://")):
-                return match.group(0)
-            image_path = Path(target).expanduser()
-            if not image_path.is_absolute():
-                image_path = Path.cwd() / image_path
-            if not image_path.exists() or not image_path.is_file():
-                return match.group(0)
-            encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-            return f"![{alt}](data:{_mime_for_image(image_path)};base64,{encoded})"
-
-        return re.sub(r"!\[(?P<alt>[^\]]*)\]\((?P<target>[^)]+)\)", repl, summary_md)
+        # Keep Markdown attachments small and readable. Zotero imported_file
+        # attachments are synced by the user's file-sync backend; embedding
+        # extracted figures as base64 can make one note many MBs and trigger
+        # WebDAV failures. Local Markdown keeps the asset paths, while Zotero
+        # gets the same lightweight file.
+        return summary_md
 
     def _write_summary_attachment(
         self,
@@ -561,6 +630,8 @@ class SummaryService:
             except Exception:
                 page_text = ""
             caption = _caption_for_page(page_text)
+            if not caption:
+                continue
             try:
                 images = list(page.images)
             except Exception:
@@ -652,6 +723,25 @@ class SummaryService:
         cached = self._cached_canonical(zotero_key=zotero_key, canonical_key=canonical_key, pdf_hash=pdf_hash, options=options)
         if cached and cached.full_summary_md:
             return cached.full_summary_md
+        input_char_count = len(AIClient.clean_text_for_json(text or ""))
+        used_char_count = used_text_char_count(text, options.max_chars)
+        is_truncated = text_would_be_truncated(text, options.max_chars)
+        quality_source = "pdf_excerpt" if source == "pdf" and is_truncated else source
+        if source == "abstract":
+            source_completeness = "abstract_only"
+            summary_kind = "abstract_card"
+        elif quality_source == "pdf_excerpt":
+            source_completeness = "excerpt"
+            summary_kind = "excerpt_card"
+        elif source == "deepxiv":
+            source_completeness = "structured_fulltext"
+            summary_kind = "canonical"
+        elif source == "pdf":
+            source_completeness = "full_text"
+            summary_kind = "canonical"
+        else:
+            source_completeness = quality_source or "unknown"
+            summary_kind = "canonical"
         summary = self.ai.summarize_paper_excerpt(
             title=title,
             text=text,
@@ -671,14 +761,29 @@ class SummaryService:
             title=title,
             locale=options.locale,
             source=source,
-            summary_kind="canonical",
+            summary_kind=summary_kind,
             pdf_hash=pdf_hash,
             canonical_key=canonical_key,
             summary_profile=options.mode,
             source_priority={"pdf": 30, "deepxiv": 20, "abstract": 10, "text": 5}.get(source, 0),
             figures=figures,
+            quality_source=quality_source,
+            source_completeness=source_completeness,
+            is_input_truncated=is_truncated,
+            input_char_count=input_char_count,
+            used_char_count=used_char_count,
+            template_profile=options.mode,
         )
         if insert_attachment and options.attach_zotero:
+            saved = self.summary_store.get_by_zotero_key(zotero_key) if paper_id and self.summary_store else None
+            if saved and not self._summary_quality_reusable(saved):
+                logger.warning(
+                    "summary: not uploading low-quality/non-canonical summary item_key=%s quality_label=%s source_coverage=%s",
+                    zotero_key,
+                    saved.quality_label,
+                    saved.source_coverage,
+                )
+                return summary
             ok, attachment_key, attachment_title = self._write_summary_attachment(
                 zotero_key,
                 summary,
@@ -754,6 +859,19 @@ class SummaryService:
                 result.failed += 1
                 result.errors.append(f"Empty extracted text: {pdf_path}")
                 logger.error("summary: empty extracted text path=%s", pdf_path)
+                continue
+            if text_would_be_truncated(text, options.max_chars) and not options.allow_truncated_summary:
+                result.failed += 1
+                result.errors.append(
+                    f"PDF text would be truncated by --max-chars ({len(text)} > {options.max_chars}): {pdf_path}. "
+                    "Use a higher --max-chars or enable chunked/full-text summarization before creating canonical summaries."
+                )
+                logger.error(
+                    "summary: refusing truncated canonical summary path=%s chars=%d max_chars=%d",
+                    pdf_path,
+                    len(text),
+                    options.max_chars,
+                )
                 continue
             logger.info("summary: extracted text chars=%d title=%s", len(text), title)
             summary = self.summarize_text(
@@ -902,6 +1020,18 @@ class SummaryService:
             if not pdfs:
                 abstract_text = (metadata.get("abstractNote") or metadata.get("abstract") or "").strip()
                 if abstract_text:
+                    if not options.allow_abstract_fallback and options.mode != "brief":
+                        result.skipped += 1
+                        result.errors.append(
+                            f"Only abstract available for {note_parent_key}; skipped canonical summary. "
+                            "Use --allow-abstract-card for an explicit non-canonical摘要卡."
+                        )
+                        logger.warning(
+                            "summary: refusing abstract-only canonical summary item_key=%s title=%s",
+                            note_parent_key,
+                            title,
+                        )
+                        continue
                     cached_by_key = self._cached_by_canonical_key(canonical_key=canonical_key) if can_reuse_before_read else None
                     if cached_by_key and self._reuse_summary_for_item(
                         cached=cached_by_key,
@@ -918,7 +1048,7 @@ class SummaryService:
                         text=abstract_text,
                         locale=options.locale,
                         max_chars=min(options.max_chars, 4000),
-                        mode=options.mode,
+                        mode="brief",
                     )
                     paper_id = self._save_to_store(
                         summary,
@@ -926,12 +1056,17 @@ class SummaryService:
                         title=title,
                         locale=options.locale,
                         source="abstract",
-                        summary_kind="canonical",
+                        summary_kind="abstract_card",
                         canonical_key=canonical_key,
-                        summary_profile=options.mode,
+                        summary_profile="abstract_card",
                         source_priority=10,
+                        quality_source="abstract",
+                        source_completeness="abstract_only",
+                        input_char_count=len(AIClient.clean_text_for_json(abstract_text)),
+                        used_char_count=used_text_char_count(abstract_text, min(options.max_chars, 4000)),
+                        template_profile="abstract_card",
                     )
-                    if insert_note and options.attach_zotero:
+                    if insert_note and options.attach_zotero and options.attach_abstract_fallback:
                         ok, attachment_key, attachment_title = self._write_summary_attachment(
                             note_parent_key,
                             summary,
@@ -999,6 +1134,18 @@ class SummaryService:
                 if not text:
                     result.errors.append(f"Empty extracted text: {pdf_path}")
                     logger.error("summary: empty extracted text path=%s item_key=%s", pdf_path, note_parent_key)
+                    continue
+                if text_would_be_truncated(text, options.max_chars) and not options.allow_truncated_summary:
+                    result.errors.append(
+                        f"PDF text would be truncated by --max-chars ({len(text)} > {options.max_chars}) for {note_parent_key}: {pdf_path}"
+                    )
+                    logger.error(
+                        "summary: refusing truncated canonical summary path=%s item_key=%s chars=%d max_chars=%d",
+                        pdf_path,
+                        note_parent_key,
+                        len(text),
+                        options.max_chars,
+                    )
                     continue
                 summary = self.summarize_text(
                     title=title,
